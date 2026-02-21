@@ -1,6 +1,7 @@
 """SQLAlchemy models."""
 
 from .repo import Repo
+from .index_task import IndexTask
 from .repo_file import (
     RepoFile,
     RepoFileMetadata,
@@ -10,6 +11,7 @@ from .repo_file import (
 
 __all__ = [
     "Repo",
+    "IndexTask",
     "RepoFile",
     "RepoFileMetadata",
     "parse_owner_repo",

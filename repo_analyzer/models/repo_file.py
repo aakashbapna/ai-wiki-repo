@@ -19,7 +19,6 @@ class RepoFileMetadata(TypedDict, total=False):
     responsibility: str
     entry_point: bool
     key_elements: list[str] | str
-    last_index_at: int
 
 
 def repo_file_metadata_from_dict(data: dict[str, Union[str, int, bool, list[str]]]) -> RepoFileMetadata:
@@ -29,7 +28,6 @@ def repo_file_metadata_from_dict(data: dict[str, Union[str, int, bool, list[str]
         responsibility=data.get("responsibility") or "",
         entry_point=bool(data.get("entry_point", False)),
         key_elements=data.get("key_elements") or [],
-        last_index_at=int(data.get("last_index_at") or 0),
     )
 
 
@@ -42,7 +40,6 @@ def repo_file_metadata_to_json(meta: RepoFileMetadata | None) -> str | None:
         "responsibility": meta.get("responsibility", ""),
         "entry_point": meta.get("entry_point", False),
         "key_elements": meta.get("key_elements", []),
-        "last_index_at": meta.get("last_index_at", 0),
     })
 
 
@@ -73,6 +70,7 @@ class RepoFile(Base):
     file_name: Mapped[str] = mapped_column(String(512), nullable=False)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)  # UTC epoch
     modified_at: Mapped[int] = mapped_column(Integer, nullable=False)  # UTC epoch
+    last_index_at: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON string
     is_scan_excluded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_project_file: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -80,6 +78,12 @@ class RepoFile(Base):
 
     def __repr__(self) -> str:
         return f"<RepoFile {self.file_id} {self.repo_hash} {self.file_path!r}>"
+
+    def full_rel_path(self) -> str:
+        """Return file path including file_name."""
+        if not self.file_path:
+            return self.file_name
+        return f"{self.file_path.rstrip('/')}/{self.file_name}"
 
     def get_metadata(self) -> RepoFileMetadata | None:
         """Parse and return typed metadata from metadata_json."""

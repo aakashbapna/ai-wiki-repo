@@ -46,12 +46,13 @@ def scan_repo_files(repo_hash: str, clone_path: Path | str) -> list[RepoFile]:
             continue
         for name in filenames:
             full_path = Path(dirpath) / name
+            if not full_path.is_file():
+                continue
             try:
                 rel_path = full_path.relative_to(root)
             except ValueError:
                 continue
-            #remove file name from path
-            rel_path_str = str(rel_path).replace(name, "").replace("\\", "/").strip("/")
+            rel_path_str = rel_path.as_posix()
             try:
                 modified_at_epoch = int(full_path.stat().st_mtime)
             except OSError:
@@ -62,6 +63,7 @@ def scan_repo_files(repo_hash: str, clone_path: Path | str) -> list[RepoFile]:
                 file_name=name,
                 created_at=now,
                 modified_at=modified_at_epoch,
+                last_index_at=0,
                 metadata_json=None,
                 is_scan_excluded=is_scan_excluded_file(name),
                 is_project_file=is_project_file(name),

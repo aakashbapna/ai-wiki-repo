@@ -22,6 +22,7 @@ _MIGRATIONS: list[tuple[str, str, str, str]] = [
     ("repo_files", "is_scan_excluded", "BOOLEAN", "0"),
     ("repo_files", "is_project_file", "BOOLEAN", "0"),
     ("repo_files", "project_name", "VARCHAR(255)", "NULL"),
+    ("repo_files", "last_index_at", "INTEGER", "0"),
 ]
 
 
