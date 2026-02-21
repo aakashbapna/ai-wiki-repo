@@ -1,7 +1,7 @@
 """Repo analyzer module: clone and analyze Git repositories."""
 
 from .clone import clone_repo
-from .file_scanner import scan_repo_files
+from .repo_scanner import scan_repo_files
 from .models import RepoFile, Repo
 from .utils import is_project_file, is_scan_excluded_file
 from .managers import RepoManager

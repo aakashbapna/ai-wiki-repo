@@ -6,7 +6,7 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from ..models import Repo, RepoFile
-from ..file_scanner import scan_repo_files
+from ..repo_scanner import scan_repo_files
 
 class RepoManager:
     """Provides access to Repo model. Takes a DB session (handle) as input."""
