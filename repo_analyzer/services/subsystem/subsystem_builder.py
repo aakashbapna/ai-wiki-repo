@@ -8,8 +8,8 @@ from typing import TypedDict
 from openai import OpenAI
 from sqlalchemy.orm import Session
 
-from db import get_default_adapter
-from prompts import SUBSYSTEM_BUILDER_SYSTEM_PROMPT
+from repo_analyzer.db import get_default_adapter
+from repo_analyzer.prompts import SUBSYSTEM_BUILDER_SYSTEM_PROMPT
 from repo_analyzer.db_managers import RepoManager, SubsystemManager
 from repo_analyzer.models import IndexTask, Repo, RepoFile
 from repo_analyzer.models.index_task import TaskType

@@ -5,8 +5,8 @@ import time
 from pathlib import Path
 
 from constants import MAX_SCAN_FILE_BYTES
-from .models import RepoFile
-from .utils import is_project_file, is_scan_excluded_file
+from repo_analyzer.models import RepoFile
+from repo_analyzer.utils import is_project_file, is_scan_excluded_file
 
 EXCLUDED_FOLDERS: frozenset[str] = frozenset({
     ".git",

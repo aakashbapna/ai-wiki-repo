@@ -7,7 +7,7 @@ from enum import Enum
 from sqlalchemy import Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
-from models.base import Base
+from .base import Base
 
 
 class TaskType(str, Enum):

@@ -10,8 +10,8 @@ from typing import Iterable, TypedDict
 from openai import OpenAI
 from sqlalchemy.orm import Session
 
-from db import get_default_adapter
-from prompts import INDEX_FILE_SYSTEM_PROMPT
+from repo_analyzer.db import get_default_adapter
+from repo_analyzer.prompts import INDEX_FILE_SYSTEM_PROMPT
 from repo_analyzer.db_managers import RepoManager
 from repo_analyzer.models import IndexTask, Repo, RepoFile, RepoFileMetadata
 from repo_analyzer.models.index_task import TaskType

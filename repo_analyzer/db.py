@@ -15,7 +15,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from constants import DATA_DIR
-from models.base import Base
+from .models.base import Base
 
 # Columns to add to existing tables if missing: (table, column, sql_type, default)
 _MIGRATIONS: list[tuple[str, str, str, str]] = [

@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Callable, TypedDict
 
-from db import get_default_adapter
+from repo_analyzer.db import get_default_adapter
 from repo_analyzer.db_managers import RepoManager
 from repo_analyzer.models import Repo
 

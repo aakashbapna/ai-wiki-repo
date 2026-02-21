@@ -4,8 +4,8 @@ import time
 from pathlib import Path
 from typing import TypedDict
 
-from db import get_default_adapter
-from repo_analyzer.code_analyzer import FileForIndex, IndexTaskStatus, index_file
+from repo_analyzer.db import get_default_adapter
+from repo_analyzer.services.file.code_analyzer import FileForIndex, IndexTaskStatus, index_file
 from repo_analyzer.db_managers import RepoManager
 from repo_analyzer.models import IndexTask, Repo, RepoFile, RepoFileMetadata
 from repo_analyzer.models.index_task import TaskType

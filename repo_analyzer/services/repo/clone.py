@@ -38,7 +38,7 @@ def clone_repo(
     """
     if data_dir is None:
         # Default: repo root is parent of repo_analyzer package
-        repo_root = Path(__file__).resolve().parent.parent
+        repo_root = Path(__file__).resolve().parents[3]
         data_dir = repo_root / "data"
     else:
         data_dir = Path(data_dir)

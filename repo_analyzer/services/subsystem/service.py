@@ -2,9 +2,9 @@
 
 from typing import TypedDict
 
-from db import get_default_adapter
+from repo_analyzer.db import get_default_adapter
 from repo_analyzer.db_managers import RepoManager, SubsystemManager
-from repo_analyzer.subsystem_builder import create_subsystems
+from repo_analyzer.services.subsystem.subsystem_builder import create_subsystems
 
 
 class SubsystemResponse(TypedDict):

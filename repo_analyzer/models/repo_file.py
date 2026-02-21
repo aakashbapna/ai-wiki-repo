@@ -6,7 +6,7 @@ from typing import TypedDict, Union
 from sqlalchemy import Boolean, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
-from models.base import Base
+from .base import Base
 
 
 class RepoFileMetadata(TypedDict, total=False):

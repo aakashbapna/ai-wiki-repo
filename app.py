@@ -8,7 +8,7 @@ from openai import OpenAI
 load_dotenv()
 
 from constants import DATA_DIR
-from db import get_default_adapter
+from repo_analyzer.db import get_default_adapter
 from repo_analyzer import clone_repo, index_repo
 from repo_analyzer.services import FileService, RepoService, SubsystemService
 
@@ -20,13 +20,13 @@ db_adapter.create_tables()
 db_adapter.migrate_tables()
 
 
-@app.route("/")
+@app.route("/api/")
 def hello_world() -> str:
     logger.debug("Health check request received.")
     return "Hello, World!"
 
 
-@app.route("/fetch-repo", methods=["POST"])
+@app.route("/api/fetch-repo", methods=["POST"])
 def fetch_repo() -> tuple:
     """
     Clone a Git repository into data/repos/<slug>.
@@ -57,7 +57,7 @@ def fetch_repo() -> tuple:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/repos", methods=["GET"])
+@app.route("/api/repos", methods=["GET"])
 def list_repos() -> tuple:
     """Return all repos."""
     try:
@@ -69,7 +69,7 @@ def list_repos() -> tuple:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/repos/<string:repo_hash_>", methods=["GET"])
+@app.route("/api/repos/<string:repo_hash_>", methods=["GET"])
 def get_repo_detail(repo_hash_: str) -> tuple:
     """Return a single repo by hash."""
     try:
@@ -86,8 +86,8 @@ def get_repo_detail(repo_hash_: str) -> tuple:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/repos/<string:repo_hash_>/files", methods=["GET"])
-@app.route("/repo/<string:repo_hash_>/files", methods=["GET"])
+@app.route("/api/repos/<string:repo_hash_>/files", methods=["GET"])
+@app.route("/api/repo/<string:repo_hash_>/files", methods=["GET"])
 def list_repo_files(repo_hash_: str) -> tuple:
     """
     Return files for a repo, with optional filters.
@@ -113,7 +113,7 @@ def list_repo_files(repo_hash_: str) -> tuple:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/repos/<string:repo_hash_>/index", methods=["POST"])
+@app.route("/api/repos/<string:repo_hash_>/index", methods=["POST"])
 def index_repo_endpoint(repo_hash_: str) -> tuple:
     """Start or resume repo indexing and return task status."""
     try:
@@ -131,7 +131,7 @@ def index_repo_endpoint(repo_hash_: str) -> tuple:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/repos/<string:repo_hash_>/index", methods=["GET"])
+@app.route("/api/repos/<string:repo_hash_>/index", methods=["GET"])
 def get_index_status(repo_hash_: str) -> tuple:
     """Return current indexing task status without starting a new task."""
     try:
@@ -147,7 +147,7 @@ def get_index_status(repo_hash_: str) -> tuple:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/repos/<string:repo_hash_>/subsystems/build", methods=["POST"])
+@app.route("/api/repos/<string:repo_hash_>/subsystems/build", methods=["POST"])
 def build_subsystems(repo_hash_: str) -> tuple:
     """Rebuild subsystems for a repo and return task status."""
     try:
@@ -165,7 +165,7 @@ def build_subsystems(repo_hash_: str) -> tuple:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/repos/<string:repo_hash_>/subsystems", methods=["GET"])
+@app.route("/api/repos/<string:repo_hash_>/subsystems", methods=["GET"])
 def get_subsystems(repo_hash_: str) -> tuple:
     """Return subsystems for a repo."""
     try:
@@ -186,7 +186,7 @@ def get_subsystems(repo_hash_: str) -> tuple:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/repos/<string:repo_hash_>/files/<int:file_id>/reindex", methods=["POST"])
+@app.route("/api/repos/<string:repo_hash_>/files/<int:file_id>/reindex", methods=["POST"])
 def reindex_single_file(repo_hash_: str, file_id: int) -> tuple:
     """Re-index a single file in a repo and return updated metadata."""
     try:
@@ -204,7 +204,7 @@ def reindex_single_file(repo_hash_: str, file_id: int) -> tuple:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/repos/<string:repo_hash_>/index/stop", methods=["POST"])
+@app.route("/api/repos/<string:repo_hash_>/index/stop", methods=["POST"])
 def stop_indexing(repo_hash_: str) -> tuple:
     """Stop all running indexing tasks for a repo."""
     try:
@@ -222,7 +222,7 @@ def stop_indexing(repo_hash_: str) -> tuple:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/data", methods=["DELETE"])
+@app.route("/api/data", methods=["DELETE"])
 def clear_all_data() -> tuple:
     """Clear all data in the SQL DB (repo_files and repos)."""
     try:
@@ -235,7 +235,7 @@ def clear_all_data() -> tuple:
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/openai/health", methods=["GET"])
+@app.route("/api/openai/health", methods=["GET"])
 def openai_health() -> tuple:
     """Validate OpenAI SDK configuration."""
     try:
