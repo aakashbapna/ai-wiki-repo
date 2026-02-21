@@ -4,6 +4,7 @@ import os
 import time
 from pathlib import Path
 
+from constants import MAX_SCAN_FILE_BYTES
 from .models import RepoFile
 from .utils import is_project_file, is_scan_excluded_file
 
@@ -54,9 +55,13 @@ def scan_repo_files(repo_hash: str, clone_path: Path | str) -> list[RepoFile]:
                 continue
             rel_path_str = rel_path.as_posix()
             try:
-                modified_at_epoch = int(full_path.stat().st_mtime)
+                stat = full_path.stat()
+                modified_at_epoch = int(stat.st_mtime)
+                file_size = int(stat.st_size)
             except OSError:
                 modified_at_epoch = now
+                file_size = 0
+            is_large_file = file_size > MAX_SCAN_FILE_BYTES
             repo_files.append(RepoFile(
                 repo_hash=repo_hash,
                 file_path=rel_path_str,
@@ -64,8 +69,9 @@ def scan_repo_files(repo_hash: str, clone_path: Path | str) -> list[RepoFile]:
                 created_at=now,
                 modified_at=modified_at_epoch,
                 last_index_at=0,
+                file_size=file_size,
                 metadata_json=None,
-                is_scan_excluded=is_scan_excluded_file(name),
+                is_scan_excluded=is_scan_excluded_file(name) or is_large_file,
                 is_project_file=is_project_file(name),
                 project_name=None,
             ))

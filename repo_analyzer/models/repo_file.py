@@ -70,6 +70,7 @@ class RepoFile(Base):
     file_name: Mapped[str] = mapped_column(String(512), nullable=False)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)  # UTC epoch
     modified_at: Mapped[int] = mapped_column(Integer, nullable=False)  # UTC epoch
+    file_size: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_index_at: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON string
     is_scan_excluded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

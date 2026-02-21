@@ -62,3 +62,8 @@ from typing import Union
 def transform(value: Union[str, int]) -> str:
     ...
 ```
+
+## App Architecture
+
+- Do not put direct DB calls in `app.py`. Route handlers should call manager or service modules.
+- DB access lives in `db_managers`. Use service classes in `services` to orchestrate logic.

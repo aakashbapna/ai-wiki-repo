@@ -12,8 +12,9 @@ from sqlalchemy.orm import Session
 
 from db import get_default_adapter
 from prompts import INDEX_FILE_SYSTEM_PROMPT
-from repo_analyzer.managers import RepoManager
+from repo_analyzer.db_managers import RepoManager
 from repo_analyzer.models import IndexTask, Repo, RepoFile, RepoFileMetadata
+from repo_analyzer.models.index_task import TaskType
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,7 @@ def index_repo(repo_hash: str, *, batch_size: int = 8) -> IndexTaskStatus:
         if not files_to_index:
             task = IndexTask(
                 repo_hash=repo_hash,
+                task_type=TaskType.INDEX_FILE.value,
                 status="completed",
                 total_files=0,
                 completed_files=0,
@@ -91,6 +93,7 @@ def index_repo(repo_hash: str, *, batch_size: int = 8) -> IndexTaskStatus:
 
         task = IndexTask(
             repo_hash=repo_hash,
+            task_type=TaskType.INDEX_FILE.value,
             status="running",
             total_files=len(files_to_index),
             completed_files=0,
@@ -155,7 +158,11 @@ def index_file(files: list[FileForIndex], *, model: str = "gpt-5-mini") -> list[
 def _get_running_task(session: Session, repo_hash: str) -> IndexTask | None:
     return (
         session.query(IndexTask)
-        .filter(IndexTask.repo_hash == repo_hash, IndexTask.status == "running")
+        .filter(
+            IndexTask.repo_hash == repo_hash,
+            IndexTask.status == "running",
+            IndexTask.task_type == TaskType.INDEX_FILE.value,
+        )
         .order_by(IndexTask.created_at.desc())
         .first()
     )

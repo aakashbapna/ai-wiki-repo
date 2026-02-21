@@ -2,10 +2,17 @@
 
 import time
 
+from enum import Enum
+
 from sqlalchemy import Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from models.base import Base
+
+
+class TaskType(str, Enum):
+    INDEX_FILE = "index_file"
+    BUILD_SUBSYSTEM = "build_subsystem"
 
 
 class IndexTask(Base):
@@ -15,6 +22,12 @@ class IndexTask(Base):
 
     task_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     repo_hash: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    task_type: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=TaskType.INDEX_FILE.value,
+        index=True,
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     total_files: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     completed_files: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
