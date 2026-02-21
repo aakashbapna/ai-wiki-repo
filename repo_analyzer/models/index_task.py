@@ -13,6 +13,7 @@ from .base import Base
 class TaskType(str, Enum):
     INDEX_FILE = "index_file"
     BUILD_SUBSYSTEM = "build_subsystem"
+    BUILD_WIKI = "build_wiki"
 
 
 class IndexTask(Base):

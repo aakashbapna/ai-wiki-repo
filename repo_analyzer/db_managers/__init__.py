@@ -2,5 +2,6 @@
 
 from .repo_manager import RepoManager
 from .subsystem_manager import SubsystemManager
+from .wiki_manager import WikiManager
 
-__all__ = ["RepoManager", "SubsystemManager"]
+__all__ = ["RepoManager", "SubsystemManager", "WikiManager"]

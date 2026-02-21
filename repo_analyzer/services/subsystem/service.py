@@ -5,6 +5,7 @@ from typing import TypedDict
 from repo_analyzer.db import get_default_adapter
 from repo_analyzer.db_managers import RepoManager, SubsystemManager
 from repo_analyzer.services.subsystem.subsystem_builder import create_subsystems
+from repo_analyzer.services.wiki.service import WikiService
 
 
 class SubsystemResponse(TypedDict):
@@ -41,4 +42,6 @@ class SubsystemService:
 
     @staticmethod
     def build_subsystems(repo_hash: str) -> dict[str, object]:
-        return create_subsystems(repo_hash)
+        status = create_subsystems(repo_hash)
+        WikiService.build_wiki(repo_hash)
+        return status

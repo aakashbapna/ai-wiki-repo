@@ -6,6 +6,7 @@ from typing import TypedDict
 
 from repo_analyzer.db import get_default_adapter
 from repo_analyzer.services.file.code_analyzer import FileForIndex, IndexTaskStatus, index_file
+from repo_analyzer.services.wiki.service import WikiService
 from repo_analyzer.db_managers import RepoManager
 from repo_analyzer.models import IndexTask, Repo, RepoFile, RepoFileMetadata
 from repo_analyzer.models.index_task import TaskType
@@ -83,6 +84,7 @@ class FileService:
                 raise ValueError(f"File not found: {file_id}")
 
             meta = _index_repo_file(repo, repo_file)
+            WikiService.build_wiki(repo_hash)
             return {
                 "repo_hash": repo_hash,
                 "file_id": file_id,

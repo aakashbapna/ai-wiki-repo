@@ -10,7 +10,7 @@ load_dotenv()
 from constants import DATA_DIR
 from repo_analyzer.db import get_default_adapter
 from repo_analyzer import clone_repo, index_repo
-from repo_analyzer.services import FileService, RepoService, SubsystemService
+from repo_analyzer.services import FileService, RepoService, SubsystemService, WikiService
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.DEBUG)
@@ -183,6 +183,60 @@ def get_subsystems(repo_hash_: str) -> tuple:
         return jsonify({"error": msg}), code
     except Exception as e:
         logger.exception("get subsystems failed.")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/repos/<string:repo_hash_>/wiki/build", methods=["POST"])
+def build_wiki(repo_hash_: str) -> tuple:
+    """Build wiki pages and sidebars for a repo."""
+    try:
+        logger.info("Wiki build requested: %s", repo_hash_)
+        status = WikiService.build_wiki(repo_hash_)
+        logger.debug("Wiki build status: %s", status)
+        return jsonify(status), 200
+    except ValueError as e:
+        msg = str(e)
+        code = 404 if msg.startswith("Repo not found") else 400
+        logger.info("Wiki build validation failed: %s", msg)
+        return jsonify({"error": msg}), code
+    except Exception as e:
+        logger.exception("wiki build failed.")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/repos/<string:repo_hash_>/wiki/sidebars", methods=["GET"])
+def get_wiki_sidebars(repo_hash_: str) -> tuple:
+    """Return wiki sidebars for a repo."""
+    try:
+        logger.info("Wiki sidebars requested: %s", repo_hash_)
+        sidebars = WikiService.list_sidebars(repo_hash_)
+        return jsonify({"repo_hash": repo_hash_, "total": len(sidebars), "sidebars": sidebars}), 200
+    except ValueError as e:
+        msg = str(e)
+        code = 404 if msg.startswith("Repo not found") else 400
+        logger.info("Wiki sidebars validation failed: %s", msg)
+        return jsonify({"error": msg}), code
+    except Exception as e:
+        logger.exception("wiki sidebars failed.")
+        return jsonify({"error": str(e)}), 500
+
+
+
+
+@app.route("/api/repos/<string:repo_hash_>/wiki/pages/<int:page_id>", methods=["GET"])
+def get_wiki_page_with_contents(repo_hash_: str, page_id: int) -> tuple:
+    """Return a wiki page and its contents."""
+    try:
+        logger.info("Wiki page requested: %s page_id=%d", repo_hash_, page_id)
+        result = WikiService.get_page_with_contents(repo_hash_, page_id)
+        return jsonify(result), 200
+    except ValueError as e:
+        msg = str(e)
+        code = 404 if msg.startswith("Repo not found") or msg.startswith("Page not found") else 400
+        logger.info("Wiki page validation failed: %s", msg)
+        return jsonify({"error": msg}), code
+    except Exception as e:
+        logger.exception("wiki page failed.")
         return jsonify({"error": str(e)}), 500
 
 

@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from constants import DATA_DIR
 from .models.base import Base
+import repo_analyzer.models  # noqa: F401
 
 # Columns to add to existing tables if missing: (table, column, sql_type, default)
 _MIGRATIONS: list[tuple[str, str, str, str]] = [

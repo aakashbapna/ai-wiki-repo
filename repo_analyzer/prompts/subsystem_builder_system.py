@@ -16,7 +16,7 @@ SUBSYSTEM_BUILDER_SYSTEM_PROMPT: str = (
     "Rules:\n"
     "- Use provided file_ids only.\n"
     "- Do not invent files.\n"
-    "- Prefer 3-20 subsystems if possible.\n"
+    "- Prefer 3-10 subsystems if possible.\n"
     "- Files can belong to only one subsystem.\n"
     "- Return only JSON.\n"
 )

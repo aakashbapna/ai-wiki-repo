@@ -1,6 +1,7 @@
 """Prompt strings for LLM tasks."""
 
-from .index_file import INDEX_FILE_SYSTEM_PROMPT
+from .index_file_system import INDEX_FILE_SYSTEM_PROMPT
 from .subsystem_builder_system import SUBSYSTEM_BUILDER_SYSTEM_PROMPT
+from .wiki_builder_system import WIKI_BUILDER_SYSTEM_PROMPT
 
-__all__ = ["INDEX_FILE_SYSTEM_PROMPT", "SUBSYSTEM_BUILDER_SYSTEM_PROMPT"]
+__all__ = ["INDEX_FILE_SYSTEM_PROMPT", "SUBSYSTEM_BUILDER_SYSTEM_PROMPT", "WIKI_BUILDER_SYSTEM_PROMPT"]
