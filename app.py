@@ -3,10 +3,11 @@ import logging
 from dotenv import load_dotenv
 
 from flask import Flask, request, jsonify
+import openai._utils._logs
+openai._utils._logs.logger.setLevel(logging.WARNING)
+openai._utils._logs.httpx_logger.setLevel(logging.WARNING)
 from openai import OpenAI
-
 load_dotenv()
-
 from constants import DATA_DIR
 from repo_analyzer.db import get_default_adapter
 from repo_analyzer import clone_repo, index_repo
@@ -14,6 +15,7 @@ from repo_analyzer.services import FileService, RepoService, SubsystemService, W
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.DEBUG)
+
 logger = logging.getLogger(__name__)
 db_adapter = get_default_adapter()
 db_adapter.create_tables()
@@ -221,6 +223,21 @@ def get_wiki_sidebars(repo_hash_: str) -> tuple:
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/repos/<string:repo_hash_>/wiki/pages", methods=["GET"])
+def get_wiki_pages(repo_hash_: str) -> tuple:
+    """Return wiki pages for a repo."""
+    try:
+        logger.info("Wiki pages requested: %s", repo_hash_)
+        pages = WikiService.list_pages(repo_hash_)
+        return jsonify({"repo_hash": repo_hash_, "total": len(pages), "pages": pages}), 200
+    except ValueError as e:
+        msg = str(e)
+        code = 404 if msg.startswith("Repo not found") else 400
+        logger.info("Wiki pages validation failed: %s", msg)
+        return jsonify({"error": msg}), code
+    except Exception as e:
+        logger.exception("wiki pages failed.")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/repos/<string:repo_hash_>/wiki/pages/<int:page_id>", methods=["GET"])

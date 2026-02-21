@@ -16,6 +16,14 @@ class TaskType(str, Enum):
     BUILD_WIKI = "build_wiki"
 
 
+class TaskStatus(str, Enum):
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    STOPPED = "stopped"
+    STALE = "stale"
+
+
 class IndexTask(Base):
     """Tracks indexing tasks for a repo to support resume and status reporting."""
 
@@ -45,3 +53,17 @@ class IndexTask(Base):
             f"<IndexTask {self.task_id} repo={self.repo_hash} "
             f"status={self.status} completed={self.completed_files}/{self.total_files}>"
         )
+
+
+def is_task_stale(
+    task: IndexTask,
+    *,
+    timeout_seconds: int,
+    now: int | None = None,
+) -> bool:
+    current = int(time.time()) if now is None else int(now)
+    last_update = int(task.updated_at or 0)
+    return (
+        task.status == TaskStatus.RUNNING.value
+        and (current - last_update) > timeout_seconds
+    )

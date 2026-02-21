@@ -3,6 +3,7 @@
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, TypedDict
@@ -10,11 +11,12 @@ from typing import Iterable, TypedDict
 from openai import OpenAI
 from sqlalchemy.orm import Session
 
+from constants import INDEX_FILE_MAX_CONCURRENCY, STALE_TASK_TIMEOUT_SECONDS
 from repo_analyzer.db import get_default_adapter
 from repo_analyzer.prompts import INDEX_FILE_SYSTEM_PROMPT
 from repo_analyzer.db_managers import RepoManager
 from repo_analyzer.models import IndexTask, Repo, RepoFile, RepoFileMetadata
-from repo_analyzer.models.index_task import TaskType
+from repo_analyzer.models.index_task import TaskStatus, TaskType, is_task_stale
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +44,7 @@ class FileForIndex:
     content: str
 
 
-def index_repo(repo_hash: str, *, batch_size: int = 8) -> IndexTaskStatus:
+def index_repo(repo_hash: str, *, batch_size: int = 3) -> IndexTaskStatus:
     """
     Index a repository's files and store metadata in RepoFile.
 
@@ -61,16 +63,40 @@ def index_repo(repo_hash: str, *, batch_size: int = 8) -> IndexTaskStatus:
 
         existing = _get_running_task(session, repo_hash)
         if existing is not None:
-            logger.info(
-                "Index task already running repo_hash=%s completed=%d total=%d",
-                repo_hash,
-                existing.completed_files,
-                existing.total_files,
-            )
-            return _task_status(existing)
+            now = int(time.time())
+            if is_task_stale(existing, timeout_seconds=STALE_TASK_TIMEOUT_SECONDS, now=now):
+                logger.warning(
+                    "Index task stale repo_hash=%s task_id=%d updated_at=%d",
+                    repo_hash,
+                    existing.task_id,
+                    existing.updated_at,
+                )
+                existing.status = TaskStatus.STALE.value
+                existing.updated_at = now
+                existing.last_error = "Marked stale due to missing heartbeat."
+                session.commit()
+            else:
+                logger.info(
+                    "Index task already running repo_hash=%s completed=%d total=%d",
+                    repo_hash,
+                    existing.completed_files,
+                    existing.total_files,
+                )
+                return _task_status(existing)
 
         files = repo_manager.list_repo_files(repo_hash, filter_scan_excluded=True)
-        files_to_index = _filter_files_to_index(files, task_created_at=None)
+        logger.info(
+            "Scannable files loaded repo_hash=%s count=%d",
+            repo_hash,
+            len(files),
+        )
+        created_at = int(time.time())
+        files_to_index = _filter_files_to_index(files, task_created_at=created_at)
+        logger.info(
+            "Initial files_to_index repo_hash=%s count=%d",
+            repo_hash,
+            len(files_to_index),
+        )
         logger.info(
             "Files to index repo_hash=%s total=%d",
             repo_hash,
@@ -80,11 +106,11 @@ def index_repo(repo_hash: str, *, batch_size: int = 8) -> IndexTaskStatus:
             task = IndexTask(
                 repo_hash=repo_hash,
                 task_type=TaskType.INDEX_FILE.value,
-                status="completed",
+                status=TaskStatus.COMPLETED.value,
                 total_files=0,
                 completed_files=0,
-                created_at=int(time.time()),
-                updated_at=int(time.time()),
+                created_at=created_at,
+                updated_at=created_at,
             )
             session.add(task)
             session.flush()
@@ -94,11 +120,11 @@ def index_repo(repo_hash: str, *, batch_size: int = 8) -> IndexTaskStatus:
         task = IndexTask(
             repo_hash=repo_hash,
             task_type=TaskType.INDEX_FILE.value,
-            status="running",
+            status=TaskStatus.RUNNING.value,
             total_files=len(files_to_index),
             completed_files=0,
-            created_at=int(time.time()),
-            updated_at=int(time.time()),
+            created_at=created_at,
+            updated_at=created_at,
         )
         session.add(task)
         session.flush()
@@ -106,10 +132,19 @@ def index_repo(repo_hash: str, *, batch_size: int = 8) -> IndexTaskStatus:
 
         try:
             files_to_index = _filter_files_to_index(files, task_created_at=task.created_at)
+            logger.info(
+                "Filtered files_to_index repo_hash=%s task_id=%d created_at=%d count=%d",
+                repo_hash,
+                task.task_id,
+                task.created_at,
+                len(files_to_index),
+            )
             task.total_files = len(files_to_index)
             session.commit()
             _run_indexing(session, repo, task, files_to_index, batch_size=batch_size)
-            task.status = "completed"
+            # Reload task to pick up completed_files written by worker sessions.
+            session.expire(task)
+            task.status = TaskStatus.COMPLETED.value
             task.updated_at = int(time.time())
             session.commit()
             logger.info(
@@ -119,7 +154,7 @@ def index_repo(repo_hash: str, *, batch_size: int = 8) -> IndexTaskStatus:
                 task.total_files,
             )
         except Exception as exc:
-            task.status = "failed"
+            task.status = TaskStatus.FAILED.value
             task.updated_at = int(time.time())
             task.last_error = str(exc)
             session.commit()
@@ -144,15 +179,14 @@ def index_file(files: list[FileForIndex], *, model: str = "gpt-5-mini") -> list[
     )
     parsed = _parse_json_list(response_text)
     if len(parsed) != len(files):
-        raise ValueError(
-            f"Expected {len(files)} summaries, got {len(parsed)}. "
-            "Ensure the model returns one JSON object per file."
+        logger.warning(
+            "Index repo validation mismatch: expected %d summaries, got %d. "
+            "Continuing with best-effort reconciliation.",
+            len(files),
+            len(parsed),
         )
-    summaries: list[FileSummary] = []
-    for idx, item in enumerate(parsed):
-        summary = _normalize_summary(item, default_file_path=files[idx].file_path)
-        summaries.append(summary)
-    return summaries
+    reconciled = _reconcile_summaries(parsed, files)
+    return reconciled
 
 
 def _get_running_task(session: Session, repo_hash: str) -> IndexTask | None:
@@ -160,7 +194,7 @@ def _get_running_task(session: Session, repo_hash: str) -> IndexTask | None:
         session.query(IndexTask)
         .filter(
             IndexTask.repo_hash == repo_hash,
-            IndexTask.status == "running",
+            IndexTask.status == TaskStatus.RUNNING.value,
             IndexTask.task_type == TaskType.INDEX_FILE.value,
         )
         .order_by(IndexTask.created_at.desc())
@@ -182,14 +216,36 @@ def _task_status(task: IndexTask) -> IndexTaskStatus:
 
 def _filter_files_to_index(files: Iterable[RepoFile], *, task_created_at: int | None) -> list[RepoFile]:
     to_index: list[RepoFile] = []
+    total: int = 0
+    never_indexed: int = 0
+    stale_index: int = 0
+    skipped_recent: int = 0
     for file in files:
+        total += 1
         last_index_at = int(file.last_index_at or 0)
         if task_created_at is None:
             if last_index_at <= 0:
                 to_index.append(file)
+                never_indexed += 1
         else:
             if last_index_at <= 0 or last_index_at < task_created_at:
                 to_index.append(file)
+                if last_index_at <= 0:
+                    never_indexed += 1
+                else:
+                    stale_index += 1
+            else:
+                skipped_recent += 1
+    logger.debug(
+        "Index filter summary total=%d to_index=%d never_indexed=%d stale_index=%d skipped_recent=%d "
+        "task_created_at=%s",
+        total,
+        len(to_index),
+        never_indexed,
+        stale_index,
+        skipped_recent,
+        str(task_created_at),
+    )
     return to_index
 
 
@@ -201,21 +257,75 @@ def _run_indexing(
     *,
     batch_size: int,
 ) -> None:
+    """
+    Submit all batches concurrently (up to INDEX_FILE_MAX_CONCURRENCY workers).
+    As each batch's LLM call completes, write the results to the DB immediately
+    using a dedicated session so progress is visible without waiting for the full run.
+    """
     repo_root = repo.clone_path_resolved
-    logger.debug("Indexing repo at path=%s", repo_root)
-    for batch in _batch(files, batch_size):
-        logger.info(
-            "Indexing batch repo_hash=%s batch_size=%d completed=%d total=%d",
-            task.repo_hash,
-            len(batch),
-            task.completed_files,
-            task.total_files,
-        )
-        file_payloads = _build_file_payloads(repo_root, batch)
-        summaries = index_file(file_payloads)
-        _apply_summaries(session, task, batch, summaries)
-        task.updated_at = int(time.time())
-        session.commit()
+    task_id = task.task_id
+    repo_hash = task.repo_hash
+    adapter = get_default_adapter()
+    batches = list(_batch(files, batch_size))
+    logger.debug(
+        "Indexing repo=%s path=%s total_batches=%d concurrency=%d",
+        repo_hash, repo_root, len(batches), INDEX_FILE_MAX_CONCURRENCY,
+    )
+
+    # Each worker receives pre-built payloads (pure data, no ORM objects).
+    # Returns (batch_file_ids, summaries) so we can match back to DB rows.
+    def _process_batch(
+        batch: list[RepoFile],
+    ) -> tuple[list[int], list[FileSummary]]:
+        payloads = _build_file_payloads(repo_root, batch)
+        summaries = index_file(payloads)
+        return ([f.file_id for f in batch], summaries)
+
+    with ThreadPoolExecutor(max_workers=INDEX_FILE_MAX_CONCURRENCY) as executor:
+        future_to_batch = {
+            executor.submit(_process_batch, batch): batch
+            for batch in batches
+        }
+        for future in as_completed(future_to_batch):
+            batch = future_to_batch[future]
+            logger.info(
+                "Batch complete repo_hash=%s batch_size=%d",
+                repo_hash, len(batch),
+            )
+            try:
+                file_ids, summaries = future.result()  # re-raises on exception
+            except Exception as exc:
+                logger.exception(
+                    "Batch failed repo_hash=%s batch_size=%d",
+                    repo_hash,
+                    len(batch),
+                )
+                with adapter.session() as write_session:
+                    db_task = write_session.query(IndexTask).filter(
+                        IndexTask.task_id == task_id
+                    ).one()
+                    db_task.updated_at = int(time.time())
+                    db_task.last_error = str(exc)
+                    write_session.commit()
+                continue
+            # Write this batch's results in its own session so they land immediately.
+            with adapter.session() as write_session:
+                # Reload the files from DB by ID to get a fresh ORM-bound objects.
+                db_files: list[RepoFile] = (
+                    write_session.query(RepoFile)
+                    .filter(RepoFile.file_id.in_(file_ids))
+                    .all()
+                )
+                db_task = write_session.query(IndexTask).filter(
+                    IndexTask.task_id == task_id
+                ).one()
+                _apply_summaries(write_session, db_task, db_files, summaries)
+                db_task.updated_at = int(time.time())
+                write_session.commit()
+                logger.info(
+                    "Batch written repo_hash=%s completed=%d total=%d",
+                    repo_hash, db_task.completed_files, db_task.total_files,
+                )
 
 
 def _build_file_payloads(repo_root: Path, files: list[RepoFile]) -> list[FileForIndex]:
@@ -318,6 +428,35 @@ def _parse_json_list(text: str) -> list[dict[str, object]]:
                 out.append(item)
         return out
     raise ValueError("Expected JSON list response.")
+
+
+def _reconcile_summaries(
+    parsed: list[dict[str, object]],
+    files: list[FileForIndex],
+) -> list[FileSummary]:
+    summaries_by_path: dict[str, dict[str, object]] = {}
+    unmatched: list[dict[str, object]] = []
+    for item in parsed:
+        file_path_value = item.get("file_path")
+        file_path = str(file_path_value) if file_path_value else ""
+        if file_path and file_path not in summaries_by_path:
+            summaries_by_path[file_path] = item
+        else:
+            unmatched.append(item)
+
+    reconciled: list[FileSummary] = []
+    unmatched_idx = 0
+    for file in files:
+        item = summaries_by_path.get(file.file_path)
+        if item is None and unmatched_idx < len(unmatched):
+            item = unmatched[unmatched_idx]
+            unmatched_idx += 1
+        if item is None:
+            item = {}
+        reconciled.append(
+            _normalize_summary(item, default_file_path=file.file_path)
+        )
+    return reconciled
 
 
 def _normalize_summary(item: dict[str, object], *, default_file_path: str) -> FileSummary:

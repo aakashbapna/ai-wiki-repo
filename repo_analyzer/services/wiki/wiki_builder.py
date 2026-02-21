@@ -3,16 +3,19 @@
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict
 
 from openai import OpenAI
 from sqlalchemy.orm import Session
 
+from constants import BUILD_WIKI_MAX_CONCURRENCY, STALE_TASK_TIMEOUT_SECONDS
 from repo_analyzer.db import get_default_adapter
 from repo_analyzer.db_managers import RepoManager, WikiManager
 from repo_analyzer.models import IndexTask, Repo, RepoFile, RepoSubsystem
-from repo_analyzer.models.index_task import TaskType
+from repo_analyzer.models.index_task import TaskStatus, TaskType, is_task_stale
 from repo_analyzer.prompts import WIKI_BUILDER_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
@@ -51,14 +54,27 @@ def build_wiki(repo_hash: str, *, model: str = "gpt-5-mini") -> WikiTaskStatus:
 
         existing = _get_running_task(session, repo_hash)
         if existing is not None:
-            return _task_status(existing)
+            now = int(time.time())
+            if is_task_stale(existing, timeout_seconds=STALE_TASK_TIMEOUT_SECONDS, now=now):
+                logger.warning(
+                    "Wiki task stale repo_hash=%s task_id=%d updated_at=%d",
+                    repo_hash,
+                    existing.task_id,
+                    existing.updated_at,
+                )
+                existing.status = TaskStatus.STALE.value
+                existing.updated_at = now
+                existing.last_error = "Marked stale due to missing heartbeat."
+                session.commit()
+            else:
+                return _task_status(existing)
 
         subsystems = _list_subsystems(session, repo_hash)
         total_files = sum(len((s.get_meta() or {}).get("file_ids", [])) for s in subsystems)
         task = IndexTask(
             repo_hash=repo_hash,
             task_type=TaskType.BUILD_WIKI.value,
-            status="running",
+            status=TaskStatus.RUNNING.value,
             total_files=total_files,
             completed_files=0,
             created_at=int(time.time()),
@@ -69,11 +85,13 @@ def build_wiki(repo_hash: str, *, model: str = "gpt-5-mini") -> WikiTaskStatus:
 
         try:
             _rebuild_wiki(session, repo, subsystems, task, model=model)
-            task.status = "completed"
+            # Reload task to pick up completed_files written by worker sessions.
+            session.expire(task)
+            task.status = TaskStatus.COMPLETED.value
             task.updated_at = int(time.time())
             session.commit()
         except Exception as exc:
-            task.status = "failed"
+            task.status = TaskStatus.FAILED.value
             task.updated_at = int(time.time())
             task.last_error = str(exc)
             session.commit()
@@ -90,42 +108,153 @@ def _rebuild_wiki(
     *,
     model: str,
 ) -> None:
-    wiki_manager = WikiManager(session)
+    """
+    Delete all existing wiki data, then generate one page per subsystem
+    concurrently (up to BUILD_WIKI_MAX_CONCURRENCY workers). Each worker
+    writes its page, content nodes, and sidebar to the DB in its own session
+    immediately on completion — no waiting for the full run to finish.
+    """
+    adapter = get_default_adapter()
+    repo_hash = repo.repo_hash
+    task_id = task.task_id
 
-    wiki_manager.delete_by_repo(repo.repo_hash)
+    # Delete existing wiki data and commit so worker threads can acquire the
+    # write lock immediately instead of waiting for the outer session to close.
+    WikiManager(session).delete_by_repo(repo_hash)
+    session.commit()
 
-    for subsystem in subsystems:
-        meta = subsystem.get_meta() or {}
+    # Snapshot plain data from ORM objects so workers don't share session state.
+    @dataclass(frozen=True)
+    class SubsystemSnapshot:
+        subsystem_id: int
+        name: str
+        description: str
+        file_ids: list[int]
+        meta_json: str | None
+
+    snapshots: list[SubsystemSnapshot] = []
+    for s in subsystems:
+        meta = s.get_meta() or {}
         file_ids = [int(x) for x in (meta.get("file_ids") or [])]
-        if not file_ids:
-            _create_sidebar_only(wiki_manager, repo.repo_hash, subsystem, is_active=False)
-            continue
+        snapshots.append(SubsystemSnapshot(
+            subsystem_id=s.subsystem_id,
+            name=s.name,
+            description=s.description,
+            file_ids=file_ids,
+            meta_json=s.meta_json,
+        ))
 
-        files = _fetch_files_for_subsystem(session, repo.repo_hash, file_ids)
-        page_spec = _generate_page(repo, subsystem, files, model=model)
-        page = wiki_manager.add_page(
-            repo_hash=repo.repo_hash,
-            title=page_spec["title"],
-            subsystem_ids=[subsystem.subsystem_id],
-        )
+    repo_full_name = repo.full_name
+    repo_clone_path = repo.clone_path_resolved
 
-        content_nodes = page_spec.get("contents") or []
-        if not content_nodes:
-            _create_sidebar_only(wiki_manager, repo.repo_hash, subsystem, is_active=False, page_id=page.page_id)
-            continue
+    def _process_subsystem(snap: SubsystemSnapshot) -> None:
+        """Generate and persist one wiki page inside its own DB session."""
+        with adapter.session() as write_session:
+            wiki_manager = WikiManager(write_session)
 
-        for node in content_nodes:
-            wiki_manager.add_content(
-                page_id=page.page_id,
-                content_type=node["content_type"],
-                content=node["content"],
-                source_file_ids=node["source_file_ids"],
+            if not snap.file_ids:
+                wiki_manager.add_sidebar(
+                    repo_hash=repo_hash,
+                    parent_node_id=None,
+                    name=snap.name,
+                    page_id=None,
+                    is_active=False,
+                    sub_system_ids=[snap.subsystem_id],
+                )
+                write_session.commit()
+                return
+
+            db_files: list[RepoFile] = (
+                write_session.query(RepoFile)
+                .filter(RepoFile.repo_hash == repo_hash, RepoFile.file_id.in_(snap.file_ids))
+                .all()
             )
 
-        _create_sidebar_only(wiki_manager, repo.repo_hash, subsystem, is_active=True, page_id=page.page_id)
-        task.completed_files += len(file_ids)
-        task.updated_at = int(time.time())
-        session.flush()
+            page_spec = _generate_page_from_snapshot(
+                repo_full_name=repo_full_name,
+                repo_clone_path=repo_clone_path,
+                snap=snap,
+                files=db_files,
+                model=model,
+            )
+
+            page = wiki_manager.add_page(
+                repo_hash=repo_hash,
+                title=page_spec["title"],
+                subsystem_ids=[snap.subsystem_id],
+            )
+            write_session.flush()
+
+            content_nodes = page_spec.get("contents") or []
+            is_active = bool(content_nodes)
+            for node in content_nodes:
+                wiki_manager.add_content(
+                    page_id=page.page_id,
+                    content_type=node["content_type"],
+                    content=node["content"],
+                    source_file_ids=node["source_file_ids"],
+                )
+
+            wiki_manager.add_sidebar(
+                repo_hash=repo_hash,
+                parent_node_id=None,
+                name=snap.name,
+                page_id=page.page_id,
+                is_active=is_active,
+                sub_system_ids=[snap.subsystem_id],
+            )
+
+            db_task = write_session.query(IndexTask).filter(
+                IndexTask.task_id == task_id
+            ).one()
+            db_task.completed_files += len(snap.file_ids)
+            db_task.updated_at = int(time.time())
+            write_session.commit()
+            logger.info(
+                "Wiki page written subsystem=%r repo_hash=%s",
+                snap.name, repo_hash,
+            )
+
+    with ThreadPoolExecutor(max_workers=BUILD_WIKI_MAX_CONCURRENCY) as executor:
+        futures = {executor.submit(_process_subsystem, snap): snap for snap in snapshots}
+        for future in as_completed(futures):
+            future.result()  # re-raises any exception from the worker
+
+
+def _generate_page_from_snapshot(
+    *,
+    repo_full_name: str,
+    repo_clone_path: Path,
+    snap: "SubsystemSnapshot",  # type: ignore[name-defined]
+    files: list[RepoFile],
+    model: str,
+) -> WikiPageSpec:
+    """Build a wiki page spec using plain snapshot data (safe for threaded use)."""
+    lines: list[str] = []
+    lines.append("Subsystem context:")
+    lines.append(f"REPO: {repo_full_name}")
+    lines.append(f"SUBSYSTEM_ID: {snap.subsystem_id}")
+    lines.append(f"SUBSYSTEM_NAME: {snap.name}")
+    lines.append(f"SUBSYSTEM_DESCRIPTION: {snap.description}")
+    lines.append(f"SUBSYSTEM_FILE_IDS: {json.dumps(snap.file_ids)}")
+    lines.append("")
+    lines.append("FILES:")
+    for file in files:
+        file_path = repo_clone_path / Path(file.full_rel_path())
+        content = _read_file_text(file_path)
+        lines.append(f"FILE_ID: {file.file_id}")
+        lines.append(f"FILE_PATH: {file.full_rel_path()}")
+        lines.append("FILE_CONTENT:")
+        lines.append(content)
+        lines.append("END_FILE")
+        lines.append("")
+    user_prompt = "\n".join(lines)
+    response_text = _openai_response(
+        model=model,
+        system_prompt=WIKI_BUILDER_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+    )
+    return _normalize_page_spec(_parse_json_object(response_text))
 
 
 def _fetch_files_for_subsystem(
@@ -279,7 +408,7 @@ def _get_running_task(session: Session, repo_hash: str) -> IndexTask | None:
         session.query(IndexTask)
         .filter(
             IndexTask.repo_hash == repo_hash,
-            IndexTask.status == "running",
+            IndexTask.status == TaskStatus.RUNNING.value,
             IndexTask.task_type == TaskType.BUILD_WIKI.value,
         )
         .order_by(IndexTask.created_at.desc())

@@ -4,6 +4,7 @@ SUBSYSTEM_BUILDER_SYSTEM_PROMPT: str = (
     "You are analyzing a repository's indexed file summaries to propose subsystems.\n\n"
     "Goal:\n"
     "- Group related files into meaningful subsystems.\n"
+    "- identify high-level subsystems from a user-facing, feature-driven perspective." 
     "- Each subsystem must have a concise name, a 1-2 sentence description,\n"
     "  a list of keywords, and the list of file_ids it contains.\n\n"
     "Return JSON array. Each item:\n"

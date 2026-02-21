@@ -9,7 +9,8 @@ from repo_analyzer.services.file.code_analyzer import FileForIndex, IndexTaskSta
 from repo_analyzer.services.wiki.service import WikiService
 from repo_analyzer.db_managers import RepoManager
 from repo_analyzer.models import IndexTask, Repo, RepoFile, RepoFileMetadata
-from repo_analyzer.models.index_task import TaskType
+from constants import STALE_TASK_TIMEOUT_SECONDS
+from repo_analyzer.models.index_task import TaskStatus, TaskType, is_task_stale
 
 
 class ListFilesResult(TypedDict):
@@ -46,19 +47,21 @@ class FileService:
                 filter_scan_excluded=True,
                 project_file=True if project_only else None,
             )
-            file_list = [
-                {
+            file_list: list[dict[str, object]] = []
+            for f in files:
+                meta = f.get_metadata()
+                if not meta or not bool(meta.get("entry_point")):
+                    continue
+                file_list.append({
                     "file_id": f.file_id,
                     "file_path": f.file_path,
                     "file_name": f.file_name,
                     "is_project_file": f.is_project_file,
                     "is_scan_excluded": f.is_scan_excluded,
-                    "metadata": f.get_metadata(),
+                    "metadata": meta,
                     "last_index_at": f.last_index_at,
                     "file_size": f.file_size,
-                }
-                for f in files
-            ]
+                })
 
         return {
             "repo_hash": repo_hash,
@@ -106,6 +109,12 @@ class FileService:
             )
             if task is None:
                 return None
+            now = int(time.time())
+            if is_task_stale(task, timeout_seconds=STALE_TASK_TIMEOUT_SECONDS, now=now):
+                task.status = TaskStatus.STALE.value
+                task.updated_at = now
+                task.last_error = "Marked stale due to missing heartbeat."
+                session.commit()
             remaining = max(0, task.total_files - task.completed_files)
             return IndexTaskStatus(
                 repo_hash=task.repo_hash,
@@ -129,7 +138,7 @@ class FileService:
                 session.query(IndexTask)
                 .filter(
                     IndexTask.repo_hash == repo_hash,
-                    IndexTask.status == "running",
+                    IndexTask.status == TaskStatus.RUNNING.value,
                     IndexTask.task_type == TaskType.INDEX_FILE.value,
                 )
                 .all()
@@ -137,7 +146,7 @@ class FileService:
             now = int(time.time())
             stopped = 0
             for task in tasks:
-                task.status = "stopped"
+                task.status = TaskStatus.STOPPED.value
                 task.updated_at = now
                 stopped += 1
             return {

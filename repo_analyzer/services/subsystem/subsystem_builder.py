@@ -3,16 +3,18 @@
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TypedDict
 
 from openai import OpenAI
 from sqlalchemy.orm import Session
 
+from constants import BUILD_SUBSYSTEM_MAX_CONCURRENCY, STALE_TASK_TIMEOUT_SECONDS
 from repo_analyzer.db import get_default_adapter
 from repo_analyzer.prompts import SUBSYSTEM_BUILDER_SYSTEM_PROMPT
 from repo_analyzer.db_managers import RepoManager, SubsystemManager
 from repo_analyzer.models import IndexTask, Repo, RepoFile
-from repo_analyzer.models.index_task import TaskType
+from repo_analyzer.models.index_task import TaskStatus, TaskType, is_task_stale
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +49,20 @@ def create_subsystems(repo_hash: str, *, model: str = "gpt-5-mini") -> Subsystem
 
         existing = _get_running_task(session, repo_hash)
         if existing is not None:
-            return _task_status(existing)
+            now = int(time.time())
+            if is_task_stale(existing, timeout_seconds=STALE_TASK_TIMEOUT_SECONDS, now=now):
+                logger.warning(
+                    "Subsystem task stale repo_hash=%s task_id=%d updated_at=%d",
+                    repo_hash,
+                    existing.task_id,
+                    existing.updated_at,
+                )
+                existing.status = TaskStatus.STALE.value
+                existing.updated_at = now
+                existing.last_error = "Marked stale due to missing heartbeat."
+                session.commit()
+            else:
+                return _task_status(existing)
 
         files = repo_manager.list_repo_files(repo_hash, filter_scan_excluded=True)
         indexed_files = [f for f in files if f.last_index_at > 0 and f.get_metadata() is not None]
@@ -55,7 +70,7 @@ def create_subsystems(repo_hash: str, *, model: str = "gpt-5-mini") -> Subsystem
             task = IndexTask(
                 repo_hash=repo_hash,
                 task_type=TaskType.BUILD_SUBSYSTEM.value,
-                status="completed",
+                status=TaskStatus.COMPLETED.value,
                 total_files=0,
                 completed_files=0,
                 created_at=int(time.time()),
@@ -68,7 +83,7 @@ def create_subsystems(repo_hash: str, *, model: str = "gpt-5-mini") -> Subsystem
         task = IndexTask(
             repo_hash=repo_hash,
             task_type=TaskType.BUILD_SUBSYSTEM.value,
-            status="running",
+            status=TaskStatus.RUNNING.value,
             total_files=len(indexed_files),
             completed_files=0,
             created_at=int(time.time()),
@@ -78,13 +93,14 @@ def create_subsystems(repo_hash: str, *, model: str = "gpt-5-mini") -> Subsystem
         session.flush()
 
         try:
-            _rebuild_subsystems(session, repo, indexed_files, model=model)
-            task.completed_files = task.total_files
-            task.status = "completed"
+            _rebuild_subsystems(session, repo, indexed_files, model=model, task_id=task.task_id)
+            # Reload task to pick up completed_files written by worker sessions.
+            session.expire(task)
+            task.status = TaskStatus.COMPLETED.value
             task.updated_at = int(time.time())
             session.commit()
         except Exception as exc:
-            task.status = "failed"
+            task.status = TaskStatus.FAILED.value
             task.updated_at = int(time.time())
             task.last_error = str(exc)
             session.commit()
@@ -99,9 +115,20 @@ def _rebuild_subsystems(
     files: list[RepoFile],
     *,
     model: str,
+    task_id: int,
 ) -> None:
-    subsystem_manager = SubsystemManager(session)
-    subsystem_manager.delete_by_repo(repo.repo_hash)
+    """
+    Delete existing subsystems, call the LLM, then write each spec to the DB
+    in its own session as it comes off the parsed list so results are immediately
+    visible. Uses BUILD_SUBSYSTEM_MAX_CONCURRENCY workers for the write phase.
+    """
+    adapter = get_default_adapter()
+    repo_hash = repo.repo_hash
+
+    # Clear existing subsystems and commit so worker threads can acquire the
+    # write lock immediately instead of waiting for the outer session to close.
+    SubsystemManager(session).delete_by_repo(repo_hash)
+    session.commit()
 
     prompt = _build_user_prompt(files)
     response_text = _openai_response(
@@ -109,17 +136,32 @@ def _rebuild_subsystems(
         system_prompt=SUBSYSTEM_BUILDER_SYSTEM_PROMPT,
         user_prompt=prompt,
     )
-    specs = _parse_json_list(response_text)
-    for spec in specs:
-        normalized = _normalize_spec(spec)
-        subsystem_manager.add_subsystem(
-            repo_hash=repo.repo_hash,
-            name=normalized["name"],
-            description=normalized["description"],
-            file_ids=normalized["file_ids"],
-            keywords=normalized["keywords"],
-        )
-    session.flush()
+    specs = [_normalize_spec(s) for s in _parse_json_list(response_text)]
+    logger.info("Parsed %d subsystem specs for repo_hash=%s", len(specs), repo_hash)
+
+    def _write_spec(spec: SubsystemSpec) -> None:
+        with adapter.session() as write_session:
+            SubsystemManager(write_session).add_subsystem(
+                repo_hash=repo_hash,
+                name=spec["name"],
+                description=spec["description"],
+                file_ids=spec["file_ids"],
+                keywords=spec["keywords"],
+            )
+            db_task = write_session.query(IndexTask).filter(
+                IndexTask.task_id == task_id
+            ).one()
+            db_task.completed_files += 1
+            db_task.updated_at = int(time.time())
+            write_session.commit()
+            logger.info(
+                "Subsystem written name=%r repo_hash=%s", spec["name"], repo_hash
+            )
+
+    with ThreadPoolExecutor(max_workers=BUILD_SUBSYSTEM_MAX_CONCURRENCY) as executor:
+        futures = {executor.submit(_write_spec, spec): spec for spec in specs}
+        for future in as_completed(futures):
+            future.result()  # re-raises any exception from the worker
 
 
 def _get_running_task(session: Session, repo_hash: str) -> IndexTask | None:
@@ -127,7 +169,7 @@ def _get_running_task(session: Session, repo_hash: str) -> IndexTask | None:
         session.query(IndexTask)
         .filter(
             IndexTask.repo_hash == repo_hash,
-            IndexTask.status == "running",
+            IndexTask.status == TaskStatus.RUNNING.value,
             IndexTask.task_type == TaskType.BUILD_SUBSYSTEM.value,
         )
         .order_by(IndexTask.created_at.desc())
