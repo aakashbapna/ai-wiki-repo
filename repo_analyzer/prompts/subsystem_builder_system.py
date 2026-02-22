@@ -66,7 +66,7 @@ SUBSYSTEM_CLUSTER_SYSTEM_PROMPT: str = (
 
 SUBSYSTEM_MERGE_SYSTEM_PROMPT: str = (
     "You are consolidating subsystems of a repository into a final set that will "
-    "become wiki pages for onboarding new engineers.\n\n"
+    "become wiki pages for learning about what the repository does and how it works.\n\n"
     "Goal:\n"
     "- Merge subsystems that cover the same product capability or are too small to "
     "warrant their own wiki page.\n"
