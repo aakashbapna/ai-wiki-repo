@@ -180,6 +180,8 @@ class FileService:
                 raise ValueError(f"File not found: {file_id}")
             rel_path = Path(repo_file.full_rel_path())
             file_path = repo.clone_path_resolved / rel_path
+            if not file_path.exists() or not file_path.is_file():
+                raise ValueError(f"File content not found at path: {rel_path.as_posix()}")
             content = _read_file_text(file_path)
             return {
                 "repo_hash": repo_hash,
@@ -215,10 +217,6 @@ def _index_repo_file(repo: Repo, repo_file: RepoFile) -> RepoFileMetadata:
 
 
 def _read_file_text(path: Path, *, max_bytes: int = 200_000) -> str:
-    if not path.exists():
-        return ""
-    if not path.is_file():
-        return ""
     data = path.read_bytes()
     if len(data) > max_bytes:
         data = data[:max_bytes]
