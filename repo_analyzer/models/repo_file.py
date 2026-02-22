@@ -87,6 +87,9 @@ class RepoFile(Base):
         """Return file path including file_name."""
         if not self.file_path:
             return self.file_name
+        
+        if self.file_path.endswith(self.file_name):
+            return self.file_path
         return f"{self.file_path.rstrip('/')}/{self.file_name}"
 
     def get_metadata(self) -> RepoFileMetadata | None:
