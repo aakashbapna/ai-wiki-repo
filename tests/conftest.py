@@ -237,3 +237,15 @@ def make_openai_response(text: str) -> MagicMock:
     mock_resp = MagicMock()
     mock_resp.output_text = text
     return mock_resp
+
+
+def make_multi_response_client(*responses: str) -> MagicMock:
+    """Return a mock OpenAI client that returns different text for successive calls.
+
+    Useful when a single test triggers multiple LLM calls (e.g. Phase 1 + Phase 2
+    in the hierarchical clustering pipeline).
+    """
+    mock_client = MagicMock()
+    mock_responses = [make_openai_response(r) for r in responses]
+    mock_client.responses.create.side_effect = mock_responses
+    return mock_client

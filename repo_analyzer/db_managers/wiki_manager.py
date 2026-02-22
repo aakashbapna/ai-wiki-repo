@@ -64,13 +64,14 @@ class WikiManager:
         content_type: str,
         content: str,
         source_file_ids: list[int],
+        title: str,
     ) -> WikiPageContent:
         node = WikiPageContent(
             page_id=page_id,
             content_type=content_type,
             content=content,
         )
-        node.set_meta({"source_file_ids": source_file_ids})
+        node.set_meta({"source_file_ids": source_file_ids, "title": title})
         self._session.add(node)
         self._session.flush()
         return node

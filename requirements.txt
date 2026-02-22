@@ -2,6 +2,6 @@ flask>=3.0.0
 dulwich>=0.22.0
 python-dotenv>=1.0.0
 sqlalchemy>=2.0.0
-openai>=1.0.0
+openai>=2.21.0
 pytest>=8.0.0
 pytest-mock>=3.14.0

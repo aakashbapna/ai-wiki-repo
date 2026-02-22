@@ -5,3 +5,111 @@
 :root {
   color-scheme: light;
 }
+
+.hljs {
+  background: #0f172a;
+  color: #e2e8f0;
+  display: block;
+  padding: 1rem;
+  border-radius: 0.75rem;
+  overflow-x: auto;
+}
+
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-title,
+.hljs-section,
+.hljs-doctag,
+.hljs-name,
+.hljs-strong {
+  color: #7dd3fc;
+}
+
+.hljs-string,
+.hljs-attribute,
+.hljs-symbol,
+.hljs-bullet,
+.hljs-addition {
+  color: #86efac;
+}
+
+.hljs-comment,
+.hljs-quote,
+.hljs-deletion {
+  color: #94a3b8;
+}
+
+.prose {
+  color: #0f172a;
+  line-height: 1.7;
+}
+
+.prose h1,
+.prose h2,
+.prose h3,
+.prose h4 {
+  color: #0f172a;
+  font-weight: 600;
+  margin-top: 0.9em;
+  margin-bottom: 0.35em;
+}
+
+.prose h1 {
+  font-size: 1.3rem;
+}
+
+.prose h2 {
+  font-size: 1.1rem;
+}
+
+.prose h3 {
+  font-size: 1rem;
+}
+
+.prose p {
+  margin: 0.5em 0;
+  color: #1f2937;
+}
+
+.prose ul,
+.prose ol {
+  padding-left: 1.25rem;
+  margin: 0.5em 0;
+}
+
+.prose li {
+  margin: 0.25em 0;
+}
+
+.prose a {
+  color: #0f172a;
+  text-decoration: underline;
+}
+
+.prose code {
+  background: #f1f5f9;
+  border-radius: 0.375rem;
+  padding: 0.1rem 0.35rem;
+  font-size: 0.85em;
+}
+
+.prose pre {
+  background: #0f172a;
+  border-radius: 0.75rem;
+  padding: 1rem;
+  overflow-x: auto;
+}
+
+.prose pre code {
+  background: transparent;
+  padding: 0;
+  font-size: 0.85em;
+  color: #e2e8f0;
+}
+
+.prose blockquote {
+  border-left: 3px solid #e2e8f0;
+  padding-left: 1rem;
+  color: #475569;
+  margin: 1em 0;
+}

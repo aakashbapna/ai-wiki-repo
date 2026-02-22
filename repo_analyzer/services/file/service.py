@@ -30,6 +30,15 @@ class StopResult(TypedDict):
     stopped_tasks: int
 
 
+class RepoFileContent(TypedDict):
+    repo_hash: str
+    file_id: int
+    file_name: str
+    file_path: str
+    content: str
+    file_size: int
+
+
 class FileService:
     """File-related service operations."""
 
@@ -152,6 +161,33 @@ class FileService:
             return {
                 "repo_hash": repo_hash,
                 "stopped_tasks": stopped,
+            }
+
+    @staticmethod
+    def get_repo_file_content(repo_hash: str, file_id: int) -> RepoFileContent:
+        adapter = get_default_adapter()
+        with adapter.session() as session:
+            repo_manager = RepoManager(session)
+            repo = repo_manager.get_by_hash(repo_hash)
+            if repo is None:
+                raise ValueError(f"Repo not found: {repo_hash}")
+            repo_file = (
+                session.query(RepoFile)
+                .filter(RepoFile.repo_hash == repo_hash, RepoFile.file_id == file_id)
+                .first()
+            )
+            if repo_file is None:
+                raise ValueError(f"File not found: {file_id}")
+            rel_path = Path(repo_file.full_rel_path())
+            file_path = repo.clone_path_resolved / rel_path
+            content = _read_file_text(file_path)
+            return {
+                "repo_hash": repo_hash,
+                "file_id": repo_file.file_id,
+                "file_name": repo_file.file_name,
+                "file_path": repo_file.file_path,
+                "content": content,
+                "file_size": repo_file.file_size,
             }
 
 

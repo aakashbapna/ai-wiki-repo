@@ -1,11 +1,14 @@
 """Service for subsystem operations."""
 
+import time
 from typing import TypedDict
 
 from repo_analyzer.db import get_default_adapter
 from repo_analyzer.db_managers import RepoManager, SubsystemManager
+from repo_analyzer.models import IndexTask
+from repo_analyzer.models.index_task import TaskStatus, TaskType, is_task_stale
 from repo_analyzer.services.subsystem.subsystem_builder import create_subsystems
-from repo_analyzer.services.wiki.service import WikiService
+from constants import STALE_TASK_TIMEOUT_SECONDS
 
 
 class SubsystemResponse(TypedDict):
@@ -14,6 +17,15 @@ class SubsystemResponse(TypedDict):
     description: str
     meta: dict[str, object] | None
     created_at: int
+
+
+class SubsystemTaskStatus(TypedDict):
+    repo_hash: str
+    status: str
+    total_files: int
+    completed_files: int
+    remaining_files: int
+    task_id: int
 
 
 class SubsystemService:
@@ -43,5 +55,35 @@ class SubsystemService:
     @staticmethod
     def build_subsystems(repo_hash: str) -> dict[str, object]:
         status = create_subsystems(repo_hash)
-        WikiService.build_wiki(repo_hash)
         return status
+
+    @staticmethod
+    def get_build_status(repo_hash: str) -> SubsystemTaskStatus | None:
+        adapter = get_default_adapter()
+        with adapter.session() as session:
+            task = (
+                session.query(IndexTask)
+                .filter(
+                    IndexTask.repo_hash == repo_hash,
+                    IndexTask.task_type == TaskType.BUILD_SUBSYSTEM.value,
+                )
+                .order_by(IndexTask.created_at.desc())
+                .first()
+            )
+            if task is None:
+                return None
+            now = int(time.time())
+            if is_task_stale(task, timeout_seconds=STALE_TASK_TIMEOUT_SECONDS, now=now):
+                task.status = TaskStatus.STALE.value
+                task.updated_at = now
+                task.last_error = "Marked stale due to missing heartbeat."
+                session.commit()
+            remaining = max(0, task.total_files - task.completed_files)
+            return SubsystemTaskStatus(
+                repo_hash=task.repo_hash,
+                status=task.status,
+                total_files=task.total_files,
+                completed_files=task.completed_files,
+                remaining_files=remaining,
+                task_id=task.task_id,
+            )

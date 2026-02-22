@@ -19,6 +19,7 @@ class RepoFileMetadata(TypedDict, total=False):
     responsibility: str
     entry_point: bool
     key_elements: list[str] | str
+    file_summary: str
 
 
 def repo_file_metadata_from_dict(data: dict[str, Union[str, int, bool, list[str]]]) -> RepoFileMetadata:
@@ -28,6 +29,7 @@ def repo_file_metadata_from_dict(data: dict[str, Union[str, int, bool, list[str]
         responsibility=data.get("responsibility") or "",
         entry_point=bool(data.get("entry_point", False)),
         key_elements=data.get("key_elements") or [],
+        file_summary=str(data.get("file_summary") or ""),
     )
 
 
@@ -40,6 +42,7 @@ def repo_file_metadata_to_json(meta: RepoFileMetadata | None) -> str | None:
         "responsibility": meta.get("responsibility", ""),
         "entry_point": meta.get("entry_point", False),
         "key_elements": meta.get("key_elements", []),
+        "file_summary": meta.get("file_summary", ""),
     })
 
 

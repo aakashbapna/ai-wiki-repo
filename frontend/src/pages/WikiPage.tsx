@@ -3,10 +3,12 @@ import ReactMarkdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
+  fetchRepoFileContent,
   fetchRepoDetail,
   fetchWikiPage,
   fetchWikiSidebars,
   RepoSummary,
+  SourceFileSummary,
   WikiPageWithContents,
   WikiSidebarNode,
 } from "../api";
@@ -14,6 +16,80 @@ import {
 function pickDefaultPage(sidebars: WikiSidebarNode[]): number | null {
   const withPage = sidebars.find((node) => node.page_id !== null && node.is_active);
   return withPage?.page_id ?? null;
+}
+
+type SidebarTreeNode = WikiSidebarNode & { children: SidebarTreeNode[]; depth: number };
+
+function buildSidebarTree(nodes: WikiSidebarNode[]): SidebarTreeNode[] {
+  const nodeMap: Map<number, SidebarTreeNode> = new Map();
+  const roots: SidebarTreeNode[] = [];
+  nodes.forEach((node) => {
+    nodeMap.set(node.node_id, { ...node, children: [], depth: 0 });
+  });
+  nodeMap.forEach((node) => {
+    if (node.parent_node_id && nodeMap.has(node.parent_node_id)) {
+      const parent = nodeMap.get(node.parent_node_id);
+      if (parent) {
+        node.depth = parent.depth + 1;
+        parent.children.push(node);
+      }
+    } else {
+      roots.push(node);
+    }
+  });
+  return roots;
+}
+
+function flattenSidebarTree(nodes: SidebarTreeNode[]): SidebarTreeNode[] {
+  const output: SidebarTreeNode[] = [];
+  const visit = (node: SidebarTreeNode): void => {
+    output.push(node);
+    node.children.forEach(visit);
+  };
+  nodes.forEach(visit);
+  return output;
+}
+
+function guessLanguage(fileName: string): string {
+  const extension = fileName.split(".").pop()?.toLowerCase() ?? "";
+  const map: Record<string, string> = {
+    ts: "typescript",
+    tsx: "tsx",
+    js: "javascript",
+    jsx: "jsx",
+    py: "python",
+    go: "go",
+    rs: "rust",
+    java: "java",
+    rb: "ruby",
+    php: "php",
+    html: "html",
+    css: "css",
+    json: "json",
+    yml: "yaml",
+    yaml: "yaml",
+    md: "markdown",
+    sh: "bash",
+  };
+  return map[extension] ?? "";
+}
+
+function formatCodeFence(content: string, language: string): string {
+  const safeContent = content.replace(/```/g, "``\\`");
+  return `\`\`\`${language}\n${safeContent}\n\`\`\``;
+}
+
+function normalizeMarkdownHeadings(content: string): string {
+  return content
+    .split("\n")
+    .map((line) => {
+      const match = line.match(/^(#{2,4})(\S)/);
+      if (match) {
+        return `${match[1]} ${match[2]}${line.slice(match[0].length)}`;
+      }
+      return line;
+    })
+    .join("\n");
 }
 
 export default function WikiPage(): JSX.Element {
@@ -24,6 +100,15 @@ export default function WikiPage(): JSX.Element {
   const [repoDetail, setRepoDetail] = useState<RepoSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
+  const [selectedSource, setSelectedSource] = useState<{
+    file_id: number;
+    file_name: string;
+    file_path: string;
+    content: string | null;
+    file_size: number | null;
+  } | null>(null);
+  const [sourceError, setSourceError] = useState<string | null>(null);
+  const [sourceLoading, setSourceLoading] = useState<boolean>(false);
 
   const selectedPageId = useMemo(() => {
     if (pageId) {
@@ -32,6 +117,11 @@ export default function WikiPage(): JSX.Element {
     }
     return null;
   }, [pageId]);
+
+  const sidebarList = useMemo(() => {
+    const tree = buildSidebarTree(sidebars);
+    return flattenSidebarTree(tree);
+  }, [sidebars]);
 
   useEffect(() => {
     const load = async (): Promise<void> => {
@@ -83,6 +173,42 @@ export default function WikiPage(): JSX.Element {
     void loadPage();
   }, [repoHash, selectedPageId, sidebars, navigate]);
 
+  const openSourceModal = async (source: SourceFileSummary): Promise<void> => {
+    if (!repoHash) {
+      return;
+    }
+    setSourceError(null);
+    setSourceLoading(true);
+    setSelectedSource({
+      file_id: source.file_id,
+      file_name: source.file_name,
+      file_path: source.file_path,
+      content: null,
+      file_size: null,
+    });
+    try {
+      const data = await fetchRepoFileContent(repoHash, source.file_id);
+      setSelectedSource({
+        file_id: data.file_id,
+        file_name: data.file_name,
+        file_path: data.file_path,
+        content: data.content,
+        file_size: data.file_size,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to load file.";
+      setSourceError(message);
+    } finally {
+      setSourceLoading(false);
+    }
+  };
+
+  const closeSourceModal = (): void => {
+    setSelectedSource(null);
+    setSourceError(null);
+    setSourceLoading(false);
+  };
+
   if (!repoHash) {
     return <p className="text-ink/60">Missing repo hash.</p>;
   }
@@ -97,20 +223,38 @@ export default function WikiPage(): JSX.Element {
           {repoDetail ? repoDetail.url : "Repository wiki"}
         </p>
         <div className="mt-4 space-y-2">
-          {sidebars.map((node) => (
-            <Link
-              key={node.node_id}
-              to={node.page_id ? `/wiki/${repoHash}/page/${node.page_id}` : "#"}
-              className={`block rounded-lg px-3 py-2 text-sm ${
-                node.page_id === (pageData?.page.page_id ?? selectedPageId)
-                  ? "bg-ink text-white"
-                  : "bg-mist text-ink"
-              } ${!node.is_active ? "opacity-50" : ""}`}
-            >
-              {node.name}
-            </Link>
-          ))}
-          {sidebars.length === 0 && !loading && (
+          {sidebarList.map((node) => {
+            const isActive = node.page_id === (pageData?.page.page_id ?? selectedPageId);
+            const baseClass = `block rounded-lg px-3 py-2 text-sm ${
+              isActive ? "bg-ink text-white" : "text-ink"
+            } ${!node.is_active ? "opacity-50" : ""}`;
+            const style = {
+              marginLeft: `${node.depth * 12}px`,
+              fontSize: node.depth > 0 ? "0.75rem" : undefined,
+            };
+            if (!node.page_id) {
+              return (
+                <div
+                  key={node.node_id}
+                  className={`${baseClass} cursor-default bg-transparent`}
+                  style={style}
+                >
+                  {node.name}
+                </div>
+              );
+            }
+            return (
+              <Link
+                key={node.node_id}
+                to={`/wiki/${repoHash}/page/${node.page_id}`}
+                className={`${baseClass} hover:underline`}
+                style={style}
+              >
+                {node.name}
+              </Link>
+            );
+          })}
+          {sidebarList.length === 0 && !loading && (
             <p className="text-xs text-ink/60">No sidebar items yet.</p>
           )}
         </div>
@@ -128,10 +272,13 @@ export default function WikiPage(): JSX.Element {
             <div className="mt-6 space-y-6">
               {pageData.contents.map((node) => (
                 <article key={node.content_id} className="prose max-w-none">
+                  {node.title && (
+                    <h2 className="mb-2 text-lg font-semibold text-ink">{node.title}</h2>
+                  )}
                   <div className="rounded-lg border border-ink/10 bg-cloud p-4">
                     {node.content_type === "markdown" ? (
                       <ReactMarkdown rehypePlugins={[rehypeHighlight]}>
-                        {node.content}
+                        {normalizeMarkdownHeadings(node.content)}
                       </ReactMarkdown>
                     ) : (
                       <div className="whitespace-pre-wrap text-sm text-ink">
@@ -140,7 +287,23 @@ export default function WikiPage(): JSX.Element {
                     )}
                   </div>
                   <div className="mt-2 text-xs text-ink/50">
-                    Sources: {(node.meta?.source_file_ids ?? []).join(", ") || "n/a"}
+                    Sources:{" "}
+                    {node.sources.length > 0 ? (
+                      <div className="mt-1 flex flex-wrap gap-2 text-ink/70">
+                        {node.sources.map((source) => (
+                          <button
+                            key={source.file_id}
+                            type="button"
+                            onClick={() => openSourceModal(source)}
+                            className="rounded-full border border-ink/15 bg-white px-3 py-1 text-xs text-ink hover:bg-mist"
+                          >
+                            {source.file_name}
+                          </button>
+                        ))}
+                      </div>
+                    ) : (
+                      "n/a"
+                    )}
                   </div>
                 </article>
               ))}
@@ -154,6 +317,53 @@ export default function WikiPage(): JSX.Element {
           <p className="text-ink/60">No wiki pages available.</p>
         )}
       </section>
+
+      {selectedSource && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+          onClick={closeSourceModal}
+        >
+          <div
+            className="w-full max-w-5xl rounded-2xl border border-ink/10 bg-white shadow-panel"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-ink/10 px-6 py-4">
+              <div>
+                <div className="text-sm font-semibold text-ink">
+                  {selectedSource.file_name}
+                </div>
+                <div className="text-xs text-ink/60">
+                  {selectedSource.file_path}
+                  {selectedSource.file_size !== null && (
+                    <span> • {(selectedSource.file_size / 1024).toFixed(1)} KB</span>
+                  )}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={closeSourceModal}
+                className="rounded-lg border border-ink/10 bg-cloud px-3 py-1 text-xs font-semibold text-ink hover:bg-mist"
+              >
+                Close
+              </button>
+            </div>
+            <div className="max-h-[70vh] overflow-auto px-6 py-4">
+              {sourceLoading && <p className="text-sm text-ink/60">Loading file…</p>}
+              {sourceError && <p className="text-sm text-red-600">{sourceError}</p>}
+              {!sourceLoading && !sourceError && (
+                <div className="prose max-w-none">
+                  <ReactMarkdown rehypePlugins={[rehypeHighlight]}>
+                    {formatCodeFence(
+                      selectedSource.content ?? "",
+                      guessLanguage(selectedSource.file_name),
+                    )}
+                  </ReactMarkdown>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

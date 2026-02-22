@@ -15,6 +15,7 @@ ContentType = Literal["markdown", "string"]
 
 class WikiPageContentMeta(TypedDict, total=False):
     source_file_ids: list[int]
+    title: str
 
 
 def wiki_page_content_meta_to_json(meta: WikiPageContentMeta | None) -> str | None:
@@ -22,6 +23,7 @@ def wiki_page_content_meta_to_json(meta: WikiPageContentMeta | None) -> str | No
         return None
     return json.dumps({
         "source_file_ids": meta.get("source_file_ids", []),
+        "title": meta.get("title") or "",
     })
 
 
@@ -33,6 +35,7 @@ def wiki_page_content_meta_from_json(s: str | None) -> WikiPageContentMeta | Non
         if isinstance(data, dict):
             return WikiPageContentMeta(
                 source_file_ids=[int(x) for x in (data.get("source_file_ids") or [])],
+                title=str(data.get("title") or ""),
             )
     except (json.JSONDecodeError, TypeError, ValueError):
         return None

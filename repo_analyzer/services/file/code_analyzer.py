@@ -35,6 +35,7 @@ class FileSummary(TypedDict):
     key_elements: list[str]
     dependent_files: list[str]
     entry_point: bool
+    file_summary: str
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ class FileForIndex:
     file_path: str
     file_name: str
     content: str
+    file_size_bytes: int
 
 
 def index_repo(repo_hash: str, *, batch_size: int = 3) -> IndexTaskStatus:
@@ -319,7 +321,7 @@ def _run_indexing(
                 db_task = write_session.query(IndexTask).filter(
                     IndexTask.task_id == task_id
                 ).one()
-                _apply_summaries(write_session, db_task, db_files, summaries)
+                _apply_summaries(write_session, db_task, db_files, summaries, repo_root=repo_root)
                 db_task.updated_at = int(time.time())
                 write_session.commit()
                 logger.info(
@@ -332,11 +334,19 @@ def _build_file_payloads(repo_root: Path, files: list[RepoFile]) -> list[FileFor
     payloads: list[FileForIndex] = []
     for file in files:
         rel_path = Path(file.full_rel_path())
-        content = _read_file_text(repo_root / rel_path)
+        full_path = repo_root / rel_path
+        content = _read_file_text(full_path)
+        file_size_bytes = 0
+        if full_path.exists() and full_path.is_file():
+            try:
+                file_size_bytes = full_path.stat().st_size
+            except OSError:
+                file_size_bytes = 0
         payloads.append(FileForIndex(
             file_path=rel_path.as_posix(),
             file_name=file.file_name,
             content=content,
+            file_size_bytes=file_size_bytes,
         ))
     return payloads
 
@@ -346,19 +356,30 @@ def _apply_summaries(
     task: IndexTask,
     files: list[RepoFile],
     summaries: list[FileSummary],
+    *,
+    repo_root: Path,
 ) -> None:
     summary_by_path = {summary["file_path"]: summary for summary in summaries}
     now = int(time.time())
     for file in files:
+        full_path = repo_root / Path(file.full_rel_path())
+        if full_path.exists() and full_path.is_file():
+            try:
+                file.file_size = full_path.stat().st_size
+            except OSError:
+                pass
         summary = summary_by_path.get(file.full_rel_path())
         if summary is None:
             logger.debug("Missing summary for file_path=%s", file.file_path)
             continue
+        file_summary_raw = str(summary.get("file_summary") or "")
+        file_summary = file_summary_raw[:1000]
         meta: RepoFileMetadata = {
             "responsibility": summary["responsibility"],
             "key_elements": summary["key_elements"],
             "dependent_files": summary["dependent_files"],
             "entry_point": summary["entry_point"],
+            "file_summary": file_summary,
         }
         file.set_metadata(meta)
         file.last_index_at = now
@@ -389,11 +410,17 @@ def _read_file_text(path: Path, *, max_bytes: int = 200_000) -> str:
 def _build_user_prompt(files: list[FileForIndex]) -> str:
     lines: list[str] = []
     lines.append("You will be given multiple files. Return a JSON array with one object per file.")
-    lines.append("Each object must include: file_path, responsibility, key_elements, dependent_files, entry_point.")
+    lines.append(
+        "Each object must include: file_path, responsibility, key_elements, dependent_files, entry_point, file_summary."
+    )
+    lines.append(
+        "Only include file_summary if file_size_bytes > 10240, otherwise return an empty string for file_summary."
+    )
     lines.append("Return only JSON. No extra text.")
     for idx, file in enumerate(files, start=1):
         lines.append("")
         lines.append(f"FILE {idx} PATH: {file.file_path}")
+        lines.append(f"FILE {idx} SIZE BYTES: {file.file_size_bytes}")
         lines.append("CONTENT:")
         lines.append(file.content)
         lines.append(f"END FILE {idx}")
@@ -465,6 +492,7 @@ def _normalize_summary(item: dict[str, object], *, default_file_path: str) -> Fi
     entry_point = bool(item.get("entry_point") or False)
     key_elements_raw = item.get("key_elements")
     dependent_raw = item.get("dependent_files")
+    file_summary = str(item.get("file_summary") or "")
 
     key_elements = _ensure_string_list(key_elements_raw)
     dependent_files = _ensure_string_list(dependent_raw)
@@ -475,6 +503,7 @@ def _normalize_summary(item: dict[str, object], *, default_file_path: str) -> Fi
         key_elements=key_elements,
         dependent_files=dependent_files,
         entry_point=entry_point,
+        file_summary=file_summary,
     )
 
 

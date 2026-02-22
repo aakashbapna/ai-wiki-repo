@@ -1,23 +1,43 @@
-"""Build repository subsystems from indexed file metadata."""
+"""Build repository subsystems via three-phase hierarchical clustering.
+
+Phase 1 — Batch:   lightweight LLM call groups files into ≤30 batches.
+Phase 2 — Cluster: concurrent per-batch LLM calls produce subsystem specs.
+Phase 3 — Merge:   iterative LLM rounds consolidate to ≤K final subsystems.
+"""
 
 import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from typing import TypedDict
 
 from openai import OpenAI
 from sqlalchemy.orm import Session
 
-from constants import BUILD_SUBSYSTEM_MAX_CONCURRENCY, STALE_TASK_TIMEOUT_SECONDS
+from constants import (
+    BUILD_SUBSYSTEM_MAX_CONCURRENCY,
+    STALE_TASK_TIMEOUT_SECONDS,
+    SUBSYSTEM_MAX_FINAL_COUNT,
+    SUBSYSTEM_MAX_INITIAL_BATCHES,
+    SUBSYSTEM_MAX_MERGE_ROUNDS,
+)
 from repo_analyzer.db import get_default_adapter
-from repo_analyzer.prompts import SUBSYSTEM_BUILDER_SYSTEM_PROMPT
 from repo_analyzer.db_managers import RepoManager, SubsystemManager
 from repo_analyzer.models import IndexTask, Repo, RepoFile
 from repo_analyzer.models.index_task import TaskStatus, TaskType, is_task_stale
+from repo_analyzer.prompts import (
+    SUBSYSTEM_BATCH_SYSTEM_PROMPT,
+    SUBSYSTEM_CLUSTER_SYSTEM_PROMPT,
+    SUBSYSTEM_MERGE_SYSTEM_PROMPT,
+)
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Public / shared types
+# ---------------------------------------------------------------------------
 
 class SubsystemStatus(TypedDict):
     repo_hash: str
@@ -35,8 +55,35 @@ class SubsystemSpec(TypedDict):
     file_ids: list[int]
 
 
+class FileBatch(TypedDict):
+    batch_id: int
+    file_ids: list[int]
+
+
+class MergeResult(TypedDict):
+    subsystems: list[SubsystemSpec]
+    continue_merging: bool
+
+
+@dataclass(frozen=True)
+class FileMetadataSnapshot:
+    """Thread-safe snapshot of a file's indexed metadata."""
+
+    file_id: int
+    file_path: str
+    is_project_file: bool
+    responsibility: str
+    key_elements: tuple[str, ...]
+    dependent_files: tuple[str, ...]
+    entry_point: bool
+
+
+# ===================================================================
+# Entry point (unchanged public API)
+# ===================================================================
+
 def create_subsystems(repo_hash: str, *, model: str = "gpt-5-mini") -> SubsystemStatus:
-    """Rebuild all subsystems for a repo using indexed file metadata."""
+    """Rebuild all subsystems for a repo using hierarchical clustering."""
     if not repo_hash.strip():
         raise ValueError("repo_hash is required")
 
@@ -94,7 +141,6 @@ def create_subsystems(repo_hash: str, *, model: str = "gpt-5-mini") -> Subsystem
 
         try:
             _rebuild_subsystems(session, repo, indexed_files, model=model, task_id=task.task_id)
-            # Reload task to pick up completed_files written by worker sessions.
             session.expire(task)
             task.status = TaskStatus.COMPLETED.value
             task.updated_at = int(time.time())
@@ -109,6 +155,10 @@ def create_subsystems(repo_hash: str, *, model: str = "gpt-5-mini") -> Subsystem
         return _task_status(task)
 
 
+# ===================================================================
+# Orchestrator (rewritten for hierarchical clustering)
+# ===================================================================
+
 def _rebuild_subsystems(
     session: Session,
     repo: Repo,
@@ -117,52 +167,438 @@ def _rebuild_subsystems(
     model: str,
     task_id: int,
 ) -> None:
+    """Three-phase hierarchical clustering.
+
+    Phase 1: lightweight LLM call batches files into ≤30 groups.
+    Phase 2: concurrent per-batch LLM calls produce subsystem specs.
+    Phase 3: iterative merge rounds consolidate to ≤K subsystems.
     """
-    Delete existing subsystems, call the LLM, then write each spec to the DB
-    in its own session as it comes off the parsed list so results are immediately
-    visible. Uses BUILD_SUBSYSTEM_MAX_CONCURRENCY workers for the write phase.
-    """
-    adapter = get_default_adapter()
     repo_hash = repo.repo_hash
 
-    # Clear existing subsystems and commit so worker threads can acquire the
-    # write lock immediately instead of waiting for the outer session to close.
+    # Clear existing subsystems and commit so worker threads can write.
     SubsystemManager(session).delete_by_repo(repo_hash)
     session.commit()
 
-    prompt = _build_user_prompt(files)
+    # Build thread-safe snapshot lookup from ORM objects.
+    snapshot_lookup = _build_file_metadata_snapshots(files)
+
+    # Phase 1: lightweight batching.
+    all_file_ids = {f.file_id for f in files}
+    batches = _phase1_initial_batching(files, model=model, valid_file_ids=all_file_ids)
+    logger.info("Phase 1 complete: %d batches for repo_hash=%s", len(batches), repo_hash)
+
+    # Phase 2: concurrent per-batch clustering.
+    all_specs = _phase2_cluster_batches(
+        batches,
+        snapshot_lookup,
+        model=model,
+        repo_hash=repo_hash,
+        task_id=task_id,
+    )
+    logger.info("Phase 2 complete: %d subsystems for repo_hash=%s", len(all_specs), repo_hash)
+
+    # Phase 3: iterative merge (only if needed).
+    if len(all_specs) > SUBSYSTEM_MAX_FINAL_COUNT:
+        final_specs = _phase3_merge_rounds(
+            all_specs,
+            model=model,
+            repo_hash=repo_hash,
+            task_id=task_id,
+        )
+        logger.info(
+            "Phase 3 complete: %d final subsystems for repo_hash=%s",
+            len(final_specs),
+            repo_hash,
+        )
+    else:
+        logger.info(
+            "Phase 3 skipped: %d subsystems already within target",
+            len(all_specs),
+        )
+
+
+# ===================================================================
+# Phase 1 — Initial batching
+# ===================================================================
+
+def _build_batch_items(files: list[RepoFile]) -> list[dict[str, object]]:
+    """Extract lightweight metadata from RepoFile objects for Phase 1."""
+    items: list[dict[str, object]] = []
+    for f in files:
+        meta = f.get_metadata() or {}
+        items.append({
+            "file_id": f.file_id,
+            "file_path": f.full_rel_path(),
+            "file_name": f.file_name,
+            "is_project_file": bool(f.is_project_file),
+            "entry_point": bool(meta.get("entry_point", False)),
+        })
+    return items
+
+
+def _build_phase1_prompt(items: list[dict[str, object]]) -> str:
+    """Build the user prompt for the Phase 1 batching LLM call."""
+    lines: list[str] = [
+        f"Analyze these {len(items)} repository files and group them into batches.",
+        "Return only JSON.",
+    ]
+    for item in items:
+        lines.append("")
+        lines.append(f"FILE_ID: {item['file_id']}")
+        lines.append(f"PATH: {item['file_path']}")
+        lines.append(f"FILE_NAME: {item['file_name']}")
+        lines.append(f"IS_PROJECT_FILE: {str(item['is_project_file']).lower()}")
+        lines.append(f"ENTRY_POINT: {str(item['entry_point']).lower()}")
+    return "\n".join(lines)
+
+
+def _parse_phase1_response(
+    text: str,
+    *,
+    valid_file_ids: set[int],
+) -> list[FileBatch]:
+    """Parse the Phase 1 LLM response into FileBatch objects.
+
+    Creates a remainder batch for any file_ids missing from the LLM's output.
+    """
+    parsed = json.loads(text)
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        raise ValueError("Expected JSON list from Phase 1.")
+
+    batches: list[FileBatch] = []
+    seen_ids: set[int] = set()
+    for idx, item in enumerate(parsed):
+        if not isinstance(item, dict):
+            continue
+        file_ids = _ensure_int_list(item.get("file_ids"))
+        # Filter to valid IDs and deduplicate across batches.
+        unique_ids = [fid for fid in file_ids if fid in valid_file_ids and fid not in seen_ids]
+        seen_ids.update(unique_ids)
+        if unique_ids:
+            batches.append(FileBatch(
+                batch_id=item.get("batch_id", idx + 1) if isinstance(item.get("batch_id"), int) else idx + 1,
+                file_ids=unique_ids,
+            ))
+
+    # Collect any file_ids the LLM forgot into a remainder batch.
+    missing = valid_file_ids - seen_ids
+    if missing:
+        logger.warning("Phase 1 missed %d file_ids, adding remainder batch", len(missing))
+        batches.append(FileBatch(
+            batch_id=len(batches) + 1,
+            file_ids=sorted(missing),
+        ))
+
+    return batches
+
+
+def _phase1_initial_batching(
+    files: list[RepoFile],
+    *,
+    model: str,
+    valid_file_ids: set[int],
+) -> list[FileBatch]:
+    """Send lightweight file metadata to LLM, get back ≤30 batches."""
+    items = _build_batch_items(files)
+    prompt = _build_phase1_prompt(items)
+    system_prompt = SUBSYSTEM_BATCH_SYSTEM_PROMPT.format(
+        max_batches=SUBSYSTEM_MAX_INITIAL_BATCHES,
+    )
     response_text = _openai_response(
         model=model,
-        system_prompt=SUBSYSTEM_BUILDER_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         user_prompt=prompt,
     )
-    specs = [_normalize_spec(s) for s in _parse_json_list(response_text)]
-    logger.info("Parsed %d subsystem specs for repo_hash=%s", len(specs), repo_hash)
+    batches = _parse_phase1_response(response_text, valid_file_ids=valid_file_ids)
 
-    def _write_spec(spec: SubsystemSpec) -> None:
-        with adapter.session() as write_session:
-            SubsystemManager(write_session).add_subsystem(
+    # If LLM returned nothing, fall back to a single batch with all files.
+    if not batches:
+        logger.warning("Phase 1 returned 0 batches; falling back to single batch")
+        batches = [FileBatch(batch_id=1, file_ids=sorted(valid_file_ids))]
+
+    return batches
+
+
+# ===================================================================
+# Phase 2 — Concurrent per-batch clustering
+# ===================================================================
+
+def _build_file_metadata_snapshots(
+    files: list[RepoFile],
+) -> dict[int, FileMetadataSnapshot]:
+    """Build a lookup of file_id → FileMetadataSnapshot from ORM objects."""
+    lookup: dict[int, FileMetadataSnapshot] = {}
+    for f in files:
+        meta = f.get_metadata() or {}
+        lookup[f.file_id] = FileMetadataSnapshot(
+            file_id=f.file_id,
+            file_path=f.full_rel_path(),
+            is_project_file=bool(f.is_project_file),
+            responsibility=str(meta.get("responsibility", "")),
+            key_elements=tuple(str(k) for k in (meta.get("key_elements") or [])),
+            dependent_files=tuple(str(d) for d in (meta.get("dependent_files") or [])),
+            entry_point=bool(meta.get("entry_point", False)),
+        )
+    return lookup
+
+
+def _build_phase2_prompt(snapshots: list[FileMetadataSnapshot]) -> str:
+    """Build the user prompt for a Phase 2 cluster LLM call."""
+    lines: list[str] = [
+        f"Analyze these {len(snapshots)} files and define subsystems.",
+        "Return only JSON.",
+    ]
+    for snap in snapshots:
+        lines.append("")
+        lines.append(f"FILE_ID: {snap.file_id}")
+        lines.append(f"PATH: {snap.file_path}")
+        lines.append(f"RESPONSIBILITY: {snap.responsibility}")
+        lines.append(f"KEY_ELEMENTS: {json.dumps(list(snap.key_elements))}")
+        lines.append(f"DEPENDENT_FILES: {json.dumps(list(snap.dependent_files))}")
+        lines.append(f"ENTRY_POINT: {str(snap.entry_point).lower()}")
+    return "\n".join(lines)
+
+
+def _cluster_single_batch(
+    snapshots: list[FileMetadataSnapshot],
+    *,
+    model: str,
+) -> list[SubsystemSpec]:
+    """Call LLM with full metadata for one batch, return SubsystemSpecs."""
+    prompt = _build_phase2_prompt(snapshots)
+    response_text = _openai_response(
+        model=model,
+        system_prompt=SUBSYSTEM_CLUSTER_SYSTEM_PROMPT,
+        user_prompt=prompt,
+    )
+    return [_normalize_spec(s) for s in _parse_json_list(response_text)]
+
+
+def _phase2_cluster_batches(
+    batches: list[FileBatch],
+    snapshot_lookup: dict[int, FileMetadataSnapshot],
+    *,
+    model: str,
+    repo_hash: str,
+    task_id: int,
+) -> list[SubsystemSpec]:
+    """Run Phase 2 concurrently across batches.
+
+    Writes each subsystem to DB as results arrive and updates task progress.
+    """
+    adapter = get_default_adapter()
+    all_specs: list[SubsystemSpec] = []
+
+    def _process_batch(batch: FileBatch) -> list[SubsystemSpec]:
+        snapshots = [
+            snapshot_lookup[fid]
+            for fid in batch["file_ids"]
+            if fid in snapshot_lookup
+        ]
+        if not snapshots:
+            return []
+        return _cluster_single_batch(snapshots, model=model)
+
+    with ThreadPoolExecutor(max_workers=BUILD_SUBSYSTEM_MAX_CONCURRENCY) as executor:
+        future_to_batch = {
+            executor.submit(_process_batch, batch): batch
+            for batch in batches
+        }
+        for future in as_completed(future_to_batch):
+            batch = future_to_batch[future]
+            specs = future.result()  # re-raises on exception
+            all_specs.extend(specs)
+
+            # Write specs to DB and update progress.
+            with adapter.session() as write_session:
+                sub_mgr = SubsystemManager(write_session)
+                for spec in specs:
+                    sub_mgr.add_subsystem(
+                        repo_hash=repo_hash,
+                        name=spec["name"],
+                        description=spec["description"],
+                        file_ids=spec["file_ids"],
+                        keywords=spec["keywords"],
+                    )
+                db_task = write_session.query(IndexTask).filter(
+                    IndexTask.task_id == task_id,
+                ).one()
+                db_task.completed_files += len(batch["file_ids"])
+                db_task.updated_at = int(time.time())
+                write_session.commit()
+
+            logger.info(
+                "Phase 2 batch done batch_id=%d specs=%d repo_hash=%s",
+                batch["batch_id"],
+                len(specs),
+                repo_hash,
+            )
+
+    return all_specs
+
+
+# ===================================================================
+# Phase 3 — Iterative merge rounds
+# ===================================================================
+
+def _build_phase3_prompt(specs: list[SubsystemSpec]) -> str:
+    """Build the user prompt for a Phase 3 merge LLM call."""
+    lines: list[str] = [
+        f"Review these {len(specs)} subsystems and merge related ones.",
+        f"Target at most {SUBSYSTEM_MAX_FINAL_COUNT} final subsystems.",
+        "Return only JSON.",
+    ]
+    for idx, spec in enumerate(specs, 1):
+        lines.append("")
+        lines.append(f"SUBSYSTEM {idx}:")
+        lines.append(f"NAME: {spec['name']}")
+        lines.append(f"DESCRIPTION: {spec['description']}")
+        lines.append(f"KEYWORDS: {json.dumps(spec['keywords'])}")
+        lines.append(f"FILE_IDS: {json.dumps(spec['file_ids'])}")
+    return "\n".join(lines)
+
+
+def _parse_merge_response(text: str) -> MergeResult:
+    """Parse the Phase 3 LLM response into a MergeResult."""
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("Expected JSON object from Phase 3 merge.")
+
+    raw_subsystems = parsed.get("subsystems")
+    if not isinstance(raw_subsystems, list):
+        raise ValueError("Missing 'subsystems' key in merge response.")
+
+    specs = [_normalize_spec(s) for s in raw_subsystems if isinstance(s, dict)]
+    continue_merging = bool(parsed.get("continue_merging", False))
+
+    return MergeResult(subsystems=specs, continue_merging=continue_merging)
+
+
+def _merge_single_round(
+    specs: list[SubsystemSpec],
+    *,
+    model: str,
+) -> MergeResult:
+    """Call LLM with current subsystem list, return merged list + flag."""
+    prompt = _build_phase3_prompt(specs)
+    system_prompt = SUBSYSTEM_MERGE_SYSTEM_PROMPT.format(
+        max_final=SUBSYSTEM_MAX_FINAL_COUNT,
+    )
+    response_text = _openai_response(
+        model=model,
+        system_prompt=system_prompt,
+        user_prompt=prompt,
+    )
+    return _parse_merge_response(response_text)
+
+
+def _specs_are_stable(
+    prev: list[SubsystemSpec],
+    curr: list[SubsystemSpec],
+) -> bool:
+    """Check if two subsystem spec lists are effectively identical (by names)."""
+    prev_names = sorted(s["name"] for s in prev)
+    curr_names = sorted(s["name"] for s in curr)
+    return prev_names == curr_names
+
+
+def _write_subsystem_specs(
+    specs: list[SubsystemSpec],
+    *,
+    repo_hash: str,
+    task_id: int,
+) -> None:
+    """Delete existing subsystems and write a fresh set in one session."""
+    adapter = get_default_adapter()
+    with adapter.session() as write_session:
+        SubsystemManager(write_session).delete_by_repo(repo_hash)
+        sub_mgr = SubsystemManager(write_session)
+        for spec in specs:
+            sub_mgr.add_subsystem(
                 repo_hash=repo_hash,
                 name=spec["name"],
                 description=spec["description"],
                 file_ids=spec["file_ids"],
                 keywords=spec["keywords"],
             )
-            db_task = write_session.query(IndexTask).filter(
-                IndexTask.task_id == task_id
-            ).one()
-            db_task.completed_files += 1
-            db_task.updated_at = int(time.time())
-            write_session.commit()
+        db_task = write_session.query(IndexTask).filter(
+            IndexTask.task_id == task_id,
+        ).one()
+        db_task.updated_at = int(time.time())
+        write_session.commit()
+
+
+def _phase3_merge_rounds(
+    initial_specs: list[SubsystemSpec],
+    *,
+    model: str,
+    repo_hash: str,
+    task_id: int,
+) -> list[SubsystemSpec]:
+    """Run iterative merge rounds until convergence or limits reached."""
+    current_specs = initial_specs
+
+    for round_num in range(1, SUBSYSTEM_MAX_MERGE_ROUNDS + 1):
+        if len(current_specs) <= SUBSYSTEM_MAX_FINAL_COUNT:
             logger.info(
-                "Subsystem written name=%r repo_hash=%s", spec["name"], repo_hash
+                "Phase 3 round %d: already at %d subsystems, stopping",
+                round_num,
+                len(current_specs),
             )
+            break
 
-    with ThreadPoolExecutor(max_workers=BUILD_SUBSYSTEM_MAX_CONCURRENCY) as executor:
-        futures = {executor.submit(_write_spec, spec): spec for spec in specs}
-        for future in as_completed(futures):
-            future.result()  # re-raises any exception from the worker
+        try:
+            result = _merge_single_round(current_specs, model=model)
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning("Phase 3 round %d: invalid LLM response, stopping: %s", round_num, exc)
+            break
 
+        new_specs = result["subsystems"]
+        if not new_specs:
+            logger.warning("Phase 3 round %d: LLM returned empty subsystems, stopping", round_num)
+            break
+
+        if _specs_are_stable(current_specs, new_specs):
+            logger.info("Phase 3 round %d: specs stabilized", round_num)
+            current_specs = new_specs
+            break
+
+        current_specs = new_specs
+
+        # Rewrite subsystems in DB.
+        _write_subsystem_specs(
+            current_specs,
+            repo_hash=repo_hash,
+            task_id=task_id,
+        )
+
+        logger.info(
+            "Phase 3 round %d: merged to %d subsystems repo_hash=%s",
+            round_num,
+            len(current_specs),
+            repo_hash,
+        )
+
+        if not result["continue_merging"]:
+            logger.info("Phase 3 round %d: LLM says stop merging", round_num)
+            break
+
+        if len(current_specs) <= SUBSYSTEM_MAX_FINAL_COUNT:
+            logger.info(
+                "Phase 3 round %d: reached target count %d",
+                round_num,
+                len(current_specs),
+            )
+            break
+
+    return current_specs
+
+
+# ===================================================================
+# Shared helpers (unchanged)
+# ===================================================================
 
 def _get_running_task(session: Session, repo_hash: str) -> IndexTask | None:
     return (
@@ -190,6 +626,7 @@ def _task_status(task: IndexTask) -> SubsystemStatus:
 
 
 def _build_user_prompt(files: list[RepoFile]) -> str:
+    """Legacy prompt builder (kept for backward compatibility)."""
     lines: list[str] = []
     lines.append("Input files with metadata. Build subsystems from these files.")
     lines.append("Return only JSON.")

@@ -167,6 +167,22 @@ def build_subsystems(repo_hash_: str) -> tuple:
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/repos/<string:repo_hash_>/subsystems/build", methods=["GET"])
+def get_subsystem_build_status(repo_hash_: str) -> tuple:
+    """Return current subsystem build status without starting a new task."""
+    try:
+        logger.info("Subsystem build status requested: %s", repo_hash_)
+        status = SubsystemService.get_build_status(repo_hash_)
+        if status is None:
+            logger.info("No subsystem task found for repo_hash=%s", repo_hash_)
+            return jsonify({"error": f"No subsystem task found for repo: {repo_hash_}"}), 404
+        logger.debug("Subsystem build status: %s", status)
+        return jsonify(status), 200
+    except Exception as e:
+        logger.exception("get subsystem build status failed.")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/repos/<string:repo_hash_>/subsystems", methods=["GET"])
 def get_subsystems(repo_hash_: str) -> tuple:
     """Return subsystems for a repo."""
@@ -203,6 +219,22 @@ def build_wiki(repo_hash_: str) -> tuple:
         return jsonify({"error": msg}), code
     except Exception as e:
         logger.exception("wiki build failed.")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/repos/<string:repo_hash_>/wiki/build", methods=["GET"])
+def get_wiki_build_status(repo_hash_: str) -> tuple:
+    """Return current wiki build status without starting a new task."""
+    try:
+        logger.info("Wiki build status requested: %s", repo_hash_)
+        status = WikiService.get_build_status(repo_hash_)
+        if status is None:
+            logger.info("No wiki task found for repo_hash=%s", repo_hash_)
+            return jsonify({"error": f"No wiki task found for repo: {repo_hash_}"}), 404
+        logger.debug("Wiki build status: %s", status)
+        return jsonify(status), 200
+    except Exception as e:
+        logger.exception("get wiki build status failed.")
         return jsonify({"error": str(e)}), 500
 
 
@@ -272,6 +304,23 @@ def reindex_single_file(repo_hash_: str, file_id: int) -> tuple:
         return jsonify({"error": msg}), code
     except Exception as e:
         logger.exception("reindex single file failed.")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/repos/<string:repo_hash_>/files/<int:file_id>/content", methods=["GET"])
+def get_repo_file_content(repo_hash_: str, file_id: int) -> tuple:
+    """Return raw file content for a repo file."""
+    try:
+        logger.info("Repo file content requested: %s file_id=%d", repo_hash_, file_id)
+        result = FileService.get_repo_file_content(repo_hash_, file_id)
+        return jsonify(result), 200
+    except ValueError as e:
+        msg = str(e)
+        code = 404 if msg.startswith("Repo not found") or msg.startswith("File not found") else 400
+        logger.info("Repo file content validation failed: %s", msg)
+        return jsonify({"error": msg}), code
+    except Exception as e:
+        logger.exception("get repo file content failed.")
         return jsonify({"error": str(e)}), 500
 
 

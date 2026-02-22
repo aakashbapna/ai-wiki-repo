@@ -1,4 +1,4 @@
-import { NavLink, Route, Routes } from "react-router-dom";
+import { Link, NavLink, Route, Routes } from "react-router-dom";
 import HomePage from "./pages/HomePage";
 import WikiPage from "./pages/WikiPage";
 import AdminPage from "./pages/AdminPage";
@@ -11,10 +11,10 @@ export default function App(): JSX.Element {
     <div className="min-h-screen">
       <header className="border-b border-ink/10 bg-white/80 backdrop-blur">
         <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-5">
-          <div>
+          <Link to="/" className="group">
             <p className="font-display text-xl font-semibold">Repo Wiki</p>
             <p className="text-xs text-ink/60">Developer-first knowledge hub</p>
-          </div>
+          </Link>
           <nav className="flex gap-6 font-display">
             <NavLink to="/" className={navLinkClass}>
               Home

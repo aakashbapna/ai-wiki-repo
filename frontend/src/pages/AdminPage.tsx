@@ -1,19 +1,29 @@
 import { useEffect, useState } from "react";
 import {
   fetchIndexStatus,
+  fetchWikiSidebars,
+  fetchWikiStatus,
   clearAllData,
+  fetchSubsystems,
   fetchRepos,
   IndexStatus,
   RepoSummary,
+  SubsystemSummary,
   triggerIndex,
   triggerSubsystemBuild,
   triggerWikiBuild,
+  WikiSidebarNode,
 } from "../api";
 
 export default function AdminPage(): JSX.Element {
   const [repos, setRepos] = useState<RepoSummary[]>([]);
   const [selectedRepo, setSelectedRepo] = useState<string>("");
   const [status, setStatus] = useState<IndexStatus | null>(null);
+  const [subsystems, setSubsystems] = useState<SubsystemSummary[]>([]);
+  const [subsystemsLoading, setSubsystemsLoading] = useState<boolean>(false);
+  const [wikiStatus, setWikiStatus] = useState<IndexStatus | null>(null);
+  const [wikiSidebars, setWikiSidebars] = useState<WikiSidebarNode[]>([]);
+  const [wikiLoading, setWikiLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
@@ -50,6 +60,39 @@ export default function AdminPage(): JSX.Element {
     }
   };
 
+  const refreshSubsystems = async (repoHash: string): Promise<void> => {
+    try {
+      setSubsystemsLoading(true);
+      const data = await fetchSubsystems(repoHash);
+      setSubsystems(data.subsystems);
+    } catch (err) {
+      setSubsystems([]);
+    } finally {
+      setSubsystemsLoading(false);
+    }
+  };
+
+  const refreshWikiStatus = async (repoHash: string): Promise<void> => {
+    try {
+      const data = await fetchWikiStatus(repoHash);
+      setWikiStatus(data);
+    } catch (err) {
+      setWikiStatus(null);
+    }
+  };
+
+  const refreshWikiSidebars = async (repoHash: string): Promise<void> => {
+    try {
+      setWikiLoading(true);
+      const data = await fetchWikiSidebars(repoHash);
+      setWikiSidebars(data);
+    } catch (err) {
+      setWikiSidebars([]);
+    } finally {
+      setWikiLoading(false);
+    }
+  };
+
   const handleIndex = async (): Promise<void> => {
     if (!selectedRepo) {
       return;
@@ -75,6 +118,19 @@ export default function AdminPage(): JSX.Element {
       const data = await triggerSubsystemBuild(selectedRepo);
       setStatus(data);
       setActionMessage("Subsystem build started.");
+      const pollStatus = async (): Promise<IndexStatus> => {
+        while (true) {
+          const current = await fetchIndexStatus(selectedRepo);
+          if (["completed", "failed", "stale", "stopped"].includes(current.status)) {
+            return current;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+        }
+      };
+      const finalStatus = await pollStatus();
+      if (finalStatus.status === "completed") {
+        await refreshSubsystems(selectedRepo);
+      }
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "Failed to build subsystems.";
@@ -89,8 +145,21 @@ export default function AdminPage(): JSX.Element {
     setActionMessage(null);
     try {
       const data = await triggerWikiBuild(selectedRepo);
-      setStatus(data);
+      setWikiStatus(data);
       setActionMessage("Wiki build started.");
+      const pollStatus = async (): Promise<IndexStatus> => {
+        while (true) {
+          const current = await fetchWikiStatus(selectedRepo);
+          if (["completed", "failed", "stale", "stopped"].includes(current.status)) {
+            return current;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+        }
+      };
+      const finalStatus = await pollStatus();
+      if (finalStatus.status === "completed") {
+        await refreshWikiSidebars(selectedRepo);
+      }
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "Failed to build wiki.";
@@ -122,6 +191,21 @@ export default function AdminPage(): JSX.Element {
     }
     void refreshStatus(selectedRepo);
   }, [selectedRepo]);
+
+  useEffect(() => {
+    if (!selectedRepo || activeTab !== "subsystems") {
+      return;
+    }
+    void refreshSubsystems(selectedRepo);
+  }, [selectedRepo, activeTab]);
+
+  useEffect(() => {
+    if (!selectedRepo || activeTab !== "wiki") {
+      return;
+    }
+    void refreshWikiStatus(selectedRepo);
+    void refreshWikiSidebars(selectedRepo);
+  }, [selectedRepo, activeTab]);
 
   return (
     <section>
@@ -216,13 +300,55 @@ export default function AdminPage(): JSX.Element {
         {activeTab === "subsystems" && (
           <div className="mt-6 grid gap-4">
             <div className="rounded-xl border border-ink/10 bg-cloud p-4 text-sm">
-              <div className="font-semibold">Subsystem Generation</div>
+              <div className="flex items-center justify-between">
+                <span className="font-semibold">Subsystem Generation</span>
+                <button
+                  type="button"
+                  onClick={() => selectedRepo && refreshSubsystems(selectedRepo)}
+                  className="text-xs text-accentDark"
+                >
+                  Refresh
+                </button>
+              </div>
               <p className="mt-2 text-xs text-ink/60">
                 Build subsystem groupings from indexed files.
               </p>
               {actionMessage && (
                 <p className="mt-2 text-xs text-accentDark">{actionMessage}</p>
               )}
+              <div className="mt-4">
+                {subsystemsLoading && (
+                  <p className="text-xs text-ink/60">Loading subsystems…</p>
+                )}
+                {!subsystemsLoading && subsystems.length === 0 && (
+                  <p className="text-xs text-ink/60">No subsystems available.</p>
+                )}
+                {!subsystemsLoading && subsystems.length > 0 && (
+                  <div className="space-y-2 text-xs text-ink/70">
+                    {subsystems.map((subsystem) => (
+                      <div
+                        key={subsystem.subsystem_id}
+                        className="rounded-lg border border-ink/10 bg-white px-3 py-2"
+                      >
+                        <div className="flex items-center justify-between text-ink">
+                          <span className="font-semibold">
+                          {subsystem.name}
+                          </span>
+                          <span className="text-[10px] text-ink/50">
+                            #{subsystem.subsystem_id}
+                          </span>
+                        </div>
+                        <p className="mt-1 text-ink/60">
+                          {subsystem.description || "No description available."}
+                        </p>
+                        <div className="mt-2 text-[10px] text-ink/50">
+                          Created {new Date(subsystem.created_at * 1000).toLocaleString()}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
             <button
               type="button"
@@ -237,13 +363,64 @@ export default function AdminPage(): JSX.Element {
         {activeTab === "wiki" && (
           <div className="mt-6 grid gap-4">
             <div className="rounded-xl border border-ink/10 bg-cloud p-4 text-sm">
-              <div className="font-semibold">Wiki Generation</div>
+              <div className="flex items-center justify-between">
+                <span className="font-semibold">Wiki Generation</span>
+                <button
+                  type="button"
+                  onClick={() => selectedRepo && refreshWikiSidebars(selectedRepo)}
+                  className="text-xs text-accentDark"
+                >
+                  Refresh
+                </button>
+              </div>
               <p className="mt-2 text-xs text-ink/60">
                 Build wiki pages and sidebars from subsystems.
               </p>
+              {wikiStatus ? (
+                <div className="mt-3 grid gap-1 text-xs">
+                  <div>Status: {wikiStatus.status}</div>
+                  <div>
+                    Completed: {wikiStatus.completed_files} / {wikiStatus.total_files}
+                  </div>
+                  <div>Remaining: {wikiStatus.remaining_files}</div>
+                </div>
+              ) : (
+                <p className="mt-3 text-xs text-ink/60">No status available.</p>
+              )}
               {actionMessage && (
                 <p className="mt-2 text-xs text-accentDark">{actionMessage}</p>
               )}
+              <div className="mt-4">
+                {wikiLoading && (
+                  <p className="text-xs text-ink/60">Loading sidebar…</p>
+                )}
+                {!wikiLoading && wikiSidebars.length === 0 && (
+                  <p className="text-xs text-ink/60">No sidebar nodes yet.</p>
+                )}
+                {!wikiLoading && wikiSidebars.length > 0 && (
+                  <div className="space-y-2 text-xs text-ink/70">
+                    {wikiSidebars.map((node) => (
+                      <div
+                        key={node.node_id}
+                        className="rounded-lg border border-ink/10 bg-white px-3 py-2"
+                        style={{
+                          marginLeft: node.parent_node_id ? "12px" : undefined,
+                        }}
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="font-semibold">{node.name}</span>
+                          <span className="text-[10px] text-ink/50">
+                            #{node.node_id}
+                          </span>
+                        </div>
+                        <div className="mt-1 text-[10px] text-ink/50">
+                          {node.page_id ? `Page ${node.page_id}` : "No page linked"}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
             <button
               type="button"
