@@ -5,7 +5,7 @@ Covers pure helpers, Phase 1/2/3 functions, and end-to-end create_subsystems.
 
 import json
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -16,13 +16,11 @@ from repo_analyzer.services.subsystem.subsystem_builder import (
     FileMetadataSnapshot,
     FileBatch,
     SubsystemSpec,
-    _build_batch_items,
+    _build_batch_items_from_snapshots,
     _build_file_metadata_snapshots,
     _build_phase1_prompt,
     _build_phase2_prompt,
     _build_phase3_prompt,
-    _build_user_prompt,
-    _cluster_single_batch,
     _ensure_int_list,
     _ensure_string_list,
     _merge_single_round,
@@ -35,12 +33,23 @@ from repo_analyzer.services.subsystem.subsystem_builder import (
 )
 from tests.conftest import (
     make_index_task,
-    make_multi_response_client,
-    make_openai_response,
     make_repo,
     make_repo_file,
     make_subsystem,
 )
+
+
+def _make_sync_thread(monkeypatch):
+    """Patch threading.Thread so the target runs synchronously."""
+    class SyncThread:
+        def __init__(self, target=None, daemon=None, name=None, **kwargs):
+            self._target = target
+
+        def start(self):
+            if self._target:
+                self._target()
+
+    monkeypatch.setattr("repo_analyzer.services.subsystem.subsystem_builder.threading.Thread", SyncThread)
 
 
 # ── _parse_json_list ────────────────────────────────────────────────────────
@@ -121,37 +130,7 @@ class TestEnsureStringList:
         assert _ensure_string_list(None) == []
 
 
-# ── _build_user_prompt (legacy) ──────────────────────────────────────────────
-
-class TestBuildUserPrompt:
-    def test_includes_file_metadata(self, session, engine) -> None:
-        repo = make_repo(session)
-        rf = make_repo_file(session, repo, file_path="src", file_name="auth.py")
-        rf.set_metadata({
-            "responsibility": "handles JWT",
-            "key_elements": ["verify_token"],
-            "dependent_files": [],
-            "entry_point": False,
-        })
-        session.flush()
-
-        prompt = _build_user_prompt([rf])
-
-        assert str(rf.file_id) in prompt
-        assert "handles JWT" in prompt
-        assert "auth.py" in prompt
-
-    def test_includes_entry_point_flag(self, session, engine) -> None:
-        repo = make_repo(session)
-        rf = make_repo_file(session, repo, file_name="main.py")
-        rf.set_metadata({"entry_point": True, "responsibility": "boot", "key_elements": [], "dependent_files": []})
-        session.flush()
-
-        prompt = _build_user_prompt([rf])
-        assert "true" in prompt.lower()
-
-
-# ── _build_batch_items (Phase 1) ────────────────────────────────────────────
+# ── _build_batch_items_from_snapshots (Phase 1) ──────────────────────────────
 
 class TestBuildBatchItems:
     def test_extracts_fields(self, session, engine) -> None:
@@ -165,7 +144,8 @@ class TestBuildBatchItems:
         })
         session.flush()
 
-        items = _build_batch_items([rf])
+        snapshots = _build_file_metadata_snapshots([rf])
+        items = _build_batch_items_from_snapshots(list(snapshots.values()))
 
         assert len(items) == 1
         assert items[0]["file_id"] == rf.file_id
@@ -178,7 +158,8 @@ class TestBuildBatchItems:
         rf = make_repo_file(session, repo, file_name="bare.py")
         session.flush()
 
-        items = _build_batch_items([rf])
+        snapshots = _build_file_metadata_snapshots([rf])
+        items = _build_batch_items_from_snapshots(list(snapshots.values()))
 
         assert items[0]["entry_point"] is False
 
@@ -318,58 +299,6 @@ class TestBuildPhase2Prompt:
         assert '"db.py"' in prompt
 
 
-# ── _cluster_single_batch (Phase 2 worker) ──────────────────────────────────
-
-class TestClusterSingleBatch:
-    def test_returns_subsystem_specs(self, monkeypatch) -> None:
-        snap = FileMetadataSnapshot(
-            file_id=1, file_path="a.py", is_project_file=False,
-            responsibility="entry", key_elements=(), dependent_files=(),
-            entry_point=True,
-        )
-        payload = json.dumps([{
-            "name": "Core",
-            "description": "Core logic",
-            "keywords": ["main"],
-            "file_ids": [1],
-        }])
-        mock_client = MagicMock()
-        mock_client.responses.create.return_value = make_openai_response(payload)
-        monkeypatch.setattr(
-            "repo_analyzer.services.subsystem.subsystem_builder._get_openai_client",
-            lambda: mock_client,
-        )
-
-        specs = _cluster_single_batch([snap], model="gpt-5-mini")
-
-        assert len(specs) == 1
-        assert specs[0]["name"] == "Core"
-        assert specs[0]["file_ids"] == [1]
-
-    def test_batch_can_produce_multiple_subsystems(self, monkeypatch) -> None:
-        snaps = [
-            FileMetadataSnapshot(
-                file_id=i, file_path=f"f{i}.py", is_project_file=False,
-                responsibility="r", key_elements=(), dependent_files=(),
-                entry_point=False,
-            )
-            for i in range(1, 4)
-        ]
-        payload = json.dumps([
-            {"name": "Sub1", "description": "d", "keywords": [], "file_ids": [1]},
-            {"name": "Sub2", "description": "d", "keywords": [], "file_ids": [2, 3]},
-        ])
-        mock_client = MagicMock()
-        mock_client.responses.create.return_value = make_openai_response(payload)
-        monkeypatch.setattr(
-            "repo_analyzer.services.subsystem.subsystem_builder._get_openai_client",
-            lambda: mock_client,
-        )
-
-        specs = _cluster_single_batch(snaps, model="gpt-5-mini")
-        assert len(specs) == 2
-
-
 # ── _build_phase3_prompt ────────────────────────────────────────────────────
 
 class TestBuildPhase3Prompt:
@@ -465,11 +394,9 @@ class TestMergeSingleRound:
             ],
             "continue_merging": False,
         })
-        mock_client = MagicMock()
-        mock_client.responses.create.return_value = make_openai_response(payload)
         monkeypatch.setattr(
-            "repo_analyzer.services.subsystem.subsystem_builder._get_openai_client",
-            lambda: mock_client,
+            "repo_analyzer.services.subsystem.subsystem_builder.run_batch",
+            lambda requests, **kwargs: [payload],
         )
 
         result = _merge_single_round(specs, model="gpt-5-mini")
@@ -524,6 +451,7 @@ class TestCreateSubsystems:
         self, session, mock_adapter, monkeypatch
     ) -> None:
         """Full pipeline: Phase 1 batches into 1 group → Phase 2 clusters → done."""
+        _make_sync_thread(monkeypatch)
         repo = make_repo(session)
         rf = make_repo_file(
             session, repo, file_path="src", file_name="auth.py",
@@ -547,15 +475,34 @@ class TestCreateSubsystems:
             "file_ids": [rf.file_id],
         }])
 
-        mock_client = make_multi_response_client(phase1_resp, phase2_resp)
+        responses = iter([phase1_resp, phase2_resp])
+
+        def fake_run_batch(requests, **kwargs):
+            return [next(responses)]
+
+        def fake_stream_batch(requests, **kwargs):
+            text = next(responses)
+            for i in range(len(requests)):
+                yield (i, text)
+
         monkeypatch.setattr(
-            "repo_analyzer.services.subsystem.subsystem_builder._get_openai_client",
-            lambda: mock_client,
+            "repo_analyzer.services.subsystem.subsystem_builder.run_batch",
+            fake_run_batch,
+        )
+        monkeypatch.setattr(
+            "repo_analyzer.services.subsystem.subsystem_builder.stream_batch",
+            fake_stream_batch,
         )
 
-        result = create_subsystems(repo.repo_hash)
+        create_subsystems(repo.repo_hash)
 
-        assert result["status"] == "completed"
+        task = session.query(IndexTask).filter(
+            IndexTask.repo_hash == repo.repo_hash,
+            IndexTask.task_type == TaskType.BUILD_SUBSYSTEM.value,
+        ).first()
+        assert task is not None
+        assert task.status == "completed"
+
         subsystems = session.query(RepoSubsystem).filter(
             RepoSubsystem.repo_hash == repo.repo_hash
         ).all()
@@ -565,6 +512,7 @@ class TestCreateSubsystems:
     def test_deletes_existing_subsystems_before_rebuild(
         self, session, mock_adapter, monkeypatch
     ) -> None:
+        _make_sync_thread(monkeypatch)
         repo = make_repo(session)
         make_subsystem(session, repo, name="OldSubsystem")
         rf = make_repo_file(
@@ -581,10 +529,16 @@ class TestCreateSubsystems:
             "keywords": [],
             "file_ids": [rf.file_id],
         }])
-        mock_client = make_multi_response_client(phase1_resp, phase2_resp)
+
+        responses = iter([phase1_resp, phase2_resp])
+
         monkeypatch.setattr(
-            "repo_analyzer.services.subsystem.subsystem_builder._get_openai_client",
-            lambda: mock_client,
+            "repo_analyzer.services.subsystem.subsystem_builder.run_batch",
+            lambda requests, **kwargs: [next(responses)],
+        )
+        monkeypatch.setattr(
+            "repo_analyzer.services.subsystem.subsystem_builder.stream_batch",
+            lambda requests, **kwargs: [(0, next(responses))],
         )
 
         create_subsystems(repo.repo_hash)
@@ -599,6 +553,7 @@ class TestCreateSubsystems:
     def test_marks_task_failed_on_openai_error(
         self, session, mock_adapter, monkeypatch
     ) -> None:
+        _make_sync_thread(monkeypatch)
         repo = make_repo(session)
         rf = make_repo_file(
             session, repo, file_name="x.py",
@@ -607,15 +562,13 @@ class TestCreateSubsystems:
         rf.set_metadata({"responsibility": "x", "key_elements": [], "dependent_files": [], "entry_point": False})
         session.commit()
 
-        mock_client = MagicMock()
-        mock_client.responses.create.side_effect = RuntimeError("LLM error")
         monkeypatch.setattr(
-            "repo_analyzer.services.subsystem.subsystem_builder._get_openai_client",
-            lambda: mock_client,
+            "repo_analyzer.services.subsystem.subsystem_builder.run_batch",
+            lambda requests, **kwargs: [RuntimeError("LLM error")],
         )
 
-        with pytest.raises(RuntimeError, match="LLM error"):
-            create_subsystems(repo.repo_hash)
+        # create_subsystems doesn't raise — error is caught in background thread
+        create_subsystems(repo.repo_hash)
 
         task = session.query(IndexTask).filter(
             IndexTask.repo_hash == repo.repo_hash,
@@ -629,6 +582,7 @@ class TestCreateSubsystems:
         self, session, mock_adapter, monkeypatch
     ) -> None:
         """completed_files should equal total indexed files after Phase 2."""
+        _make_sync_thread(monkeypatch)
         repo = make_repo(session)
         rf1 = make_repo_file(session, repo, file_name="a.py", last_index_at=int(time.time()) - 1)
         rf1.set_metadata({"responsibility": "a", "key_elements": [], "dependent_files": [], "entry_point": False})
@@ -645,23 +599,33 @@ class TestCreateSubsystems:
         phase2_resp_a = json.dumps([{"name": "SubA", "description": "d", "keywords": [], "file_ids": [rf1.file_id]}])
         phase2_resp_b = json.dumps([{"name": "SubB", "description": "d", "keywords": [], "file_ids": [rf2.file_id]}])
 
-        mock_client = make_multi_response_client(phase1_resp, phase2_resp_a, phase2_resp_b)
+        phase2_resps = iter([phase2_resp_a, phase2_resp_b])
+
         monkeypatch.setattr(
-            "repo_analyzer.services.subsystem.subsystem_builder._get_openai_client",
-            lambda: mock_client,
+            "repo_analyzer.services.subsystem.subsystem_builder.run_batch",
+            lambda requests, **kwargs: [phase1_resp],
+        )
+        monkeypatch.setattr(
+            "repo_analyzer.services.subsystem.subsystem_builder.stream_batch",
+            lambda requests, **kwargs: [(i, next(phase2_resps)) for i in range(len(requests))],
         )
 
-        result = create_subsystems(repo.repo_hash)
+        create_subsystems(repo.repo_hash)
 
-        assert result["status"] == "completed"
-        assert result["total_files"] == 2
-        assert result["completed_files"] == 2
-        assert result["remaining_files"] == 0
+        task = session.query(IndexTask).filter(
+            IndexTask.repo_hash == repo.repo_hash,
+            IndexTask.task_type == TaskType.BUILD_SUBSYSTEM.value,
+        ).first()
+        assert task is not None
+        assert task.status == "completed"
+        assert task.total_files == 2
+        assert task.completed_files == 2
 
     def test_multiple_batches_produce_multiple_subsystems(
         self, session, mock_adapter, monkeypatch
     ) -> None:
         """Two batches each producing a subsystem → 2 subsystems in DB."""
+        _make_sync_thread(monkeypatch)
         repo = make_repo(session)
         rf1 = make_repo_file(session, repo, file_path="auth", file_name="login.py",
                              last_index_at=int(time.time()) - 1)
@@ -678,15 +642,26 @@ class TestCreateSubsystems:
         phase2_resp_1 = json.dumps([{"name": "Auth", "description": "Auth module", "keywords": ["login"], "file_ids": [rf1.file_id]}])
         phase2_resp_2 = json.dumps([{"name": "Database", "description": "DB layer", "keywords": ["orm"], "file_ids": [rf2.file_id]}])
 
-        mock_client = make_multi_response_client(phase1_resp, phase2_resp_1, phase2_resp_2)
+        phase2_resps = iter([phase2_resp_1, phase2_resp_2])
+
         monkeypatch.setattr(
-            "repo_analyzer.services.subsystem.subsystem_builder._get_openai_client",
-            lambda: mock_client,
+            "repo_analyzer.services.subsystem.subsystem_builder.run_batch",
+            lambda requests, **kwargs: [phase1_resp],
+        )
+        monkeypatch.setattr(
+            "repo_analyzer.services.subsystem.subsystem_builder.stream_batch",
+            lambda requests, **kwargs: [(i, next(phase2_resps)) for i in range(len(requests))],
         )
 
-        result = create_subsystems(repo.repo_hash)
+        create_subsystems(repo.repo_hash)
 
-        assert result["status"] == "completed"
+        task = session.query(IndexTask).filter(
+            IndexTask.repo_hash == repo.repo_hash,
+            IndexTask.task_type == TaskType.BUILD_SUBSYSTEM.value,
+        ).first()
+        assert task is not None
+        assert task.status == "completed"
+
         subsystems = session.query(RepoSubsystem).filter(
             RepoSubsystem.repo_hash == repo.repo_hash
         ).all()
@@ -697,6 +672,7 @@ class TestCreateSubsystems:
         self, session, mock_adapter, monkeypatch
     ) -> None:
         """When Phase 2 produces >10 subsystems, Phase 3 merges them."""
+        _make_sync_thread(monkeypatch)
         repo = make_repo(session)
         # Create 12 files so we can produce >10 subsystems
         files = []
@@ -722,7 +698,7 @@ class TestCreateSubsystems:
         ]
         phase2_resp = json.dumps(phase2_specs)
 
-        # Phase 3: merge down to 5 subsystems
+        # Phase 3: merge down to 4 subsystems
         merged_specs = [
             {"name": f"Merged{i}", "description": f"merged {i}", "keywords": [],
              "file_ids": file_ids[i * 3:(i + 1) * 3] if i < 3 else file_ids[9:]}
@@ -733,15 +709,26 @@ class TestCreateSubsystems:
             "continue_merging": False,
         })
 
-        mock_client = make_multi_response_client(phase1_resp, phase2_resp, phase3_resp)
+        run_batch_resps = iter([phase1_resp, phase3_resp])
+
         monkeypatch.setattr(
-            "repo_analyzer.services.subsystem.subsystem_builder._get_openai_client",
-            lambda: mock_client,
+            "repo_analyzer.services.subsystem.subsystem_builder.run_batch",
+            lambda requests, **kwargs: [next(run_batch_resps)],
+        )
+        monkeypatch.setattr(
+            "repo_analyzer.services.subsystem.subsystem_builder.stream_batch",
+            lambda requests, **kwargs: [(0, phase2_resp)],
         )
 
-        result = create_subsystems(repo.repo_hash)
+        create_subsystems(repo.repo_hash)
 
-        assert result["status"] == "completed"
+        task = session.query(IndexTask).filter(
+            IndexTask.repo_hash == repo.repo_hash,
+            IndexTask.task_type == TaskType.BUILD_SUBSYSTEM.value,
+        ).first()
+        assert task is not None
+        assert task.status == "completed"
+
         subsystems = session.query(RepoSubsystem).filter(
             RepoSubsystem.repo_hash == repo.repo_hash
         ).all()
@@ -751,7 +738,8 @@ class TestCreateSubsystems:
     def test_phase3_skipped_when_within_target(
         self, session, mock_adapter, monkeypatch
     ) -> None:
-        """When Phase 2 produces ≤10 subsystems, Phase 3 is skipped (no 3rd LLM call)."""
+        """When Phase 2 produces ≤10 subsystems, Phase 3 is skipped."""
+        _make_sync_thread(monkeypatch)
         repo = make_repo(session)
         rf = make_repo_file(
             session, repo, file_name="only.py",
@@ -763,14 +751,29 @@ class TestCreateSubsystems:
         phase1_resp = json.dumps([{"batch_id": 1, "file_ids": [rf.file_id]}])
         phase2_resp = json.dumps([{"name": "Solo", "description": "d", "keywords": [], "file_ids": [rf.file_id]}])
 
-        mock_client = make_multi_response_client(phase1_resp, phase2_resp)
+        run_batch_call_count = 0
+
+        def counting_run_batch(requests, **kwargs):
+            nonlocal run_batch_call_count
+            run_batch_call_count += 1
+            return [phase1_resp]
+
         monkeypatch.setattr(
-            "repo_analyzer.services.subsystem.subsystem_builder._get_openai_client",
-            lambda: mock_client,
+            "repo_analyzer.services.subsystem.subsystem_builder.run_batch",
+            counting_run_batch,
+        )
+        monkeypatch.setattr(
+            "repo_analyzer.services.subsystem.subsystem_builder.stream_batch",
+            lambda requests, **kwargs: [(0, phase2_resp)],
         )
 
-        result = create_subsystems(repo.repo_hash)
+        create_subsystems(repo.repo_hash)
 
-        assert result["status"] == "completed"
-        # Only 2 LLM calls (Phase 1 + Phase 2), no Phase 3
-        assert mock_client.responses.create.call_count == 2
+        task = session.query(IndexTask).filter(
+            IndexTask.repo_hash == repo.repo_hash,
+            IndexTask.task_type == TaskType.BUILD_SUBSYSTEM.value,
+        ).first()
+        assert task is not None
+        assert task.status == "completed"
+        # Only 1 run_batch call (Phase 1), no Phase 3
+        assert run_batch_call_count == 1

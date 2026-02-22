@@ -32,7 +32,8 @@ class TestFileServiceListRepoFiles:
 
     def test_returns_all_non_excluded_files(self, session, mock_adapter) -> None:
         repo = make_repo(session)
-        make_repo_file(session, repo, file_name="app.py", is_scan_excluded=False)
+        app_file = make_repo_file(session, repo, file_name="app.py", is_scan_excluded=False)
+        app_file.set_metadata({"entry_point": True, "responsibility": "main", "key_elements": [], "dependent_files": []})
         make_repo_file(session, repo, file_name="image.png", is_scan_excluded=True)
         session.commit()
 
@@ -47,8 +48,10 @@ class TestFileServiceListRepoFiles:
         repo = make_repo(session)
         pf = make_repo_file(session, repo, file_name="package.json", is_scan_excluded=False)
         pf.is_project_file = True
+        pf.set_metadata({"entry_point": True, "responsibility": "pkg", "key_elements": [], "dependent_files": []})
         rf = make_repo_file(session, repo, file_name="app.py", is_scan_excluded=False)
         rf.is_project_file = False
+        rf.set_metadata({"entry_point": True, "responsibility": "app", "key_elements": [], "dependent_files": []})
         session.flush()
         session.commit()
 
@@ -60,7 +63,8 @@ class TestFileServiceListRepoFiles:
 
     def test_result_contains_expected_fields(self, session, mock_adapter) -> None:
         repo = make_repo(session)
-        make_repo_file(session, repo, file_name="utils.py")
+        rf = make_repo_file(session, repo, file_name="utils.py")
+        rf.set_metadata({"entry_point": True, "responsibility": "utils", "key_elements": [], "dependent_files": []})
         session.commit()
 
         result = FileService.list_repo_files(repo.repo_hash, project_only=False)
@@ -160,17 +164,15 @@ class TestFileServiceReindexSingleFile:
         session.commit()
 
         response_payload = json.dumps([{
-            "file_path": "./app.py",
+            "file_path": "app.py",
             "responsibility": "main app",
             "key_elements": ["x"],
             "dependent_files": [],
             "entry_point": True,
         }])
-        mock_client = MagicMock()
-        mock_client.responses.create.return_value = make_openai_response(response_payload)
         monkeypatch.setattr(
-            "repo_analyzer.services.file.code_analyzer._get_openai_client",
-            lambda: mock_client,
+            "repo_analyzer.services.file.code_analyzer.run_batch",
+            lambda requests, **kwargs: [response_payload],
         )
 
         # Mock WikiService.build_wiki so it doesn't cascade

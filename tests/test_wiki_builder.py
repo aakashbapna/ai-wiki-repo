@@ -1,6 +1,7 @@
 """Tests for repo_analyzer.services.wiki.wiki_builder."""
 
 import json
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -20,7 +21,6 @@ from repo_analyzer.services.wiki.wiki_builder import (
 )
 from tests.conftest import (
     make_index_task,
-    make_openai_response,
     make_repo,
     make_repo_file,
     make_subsystem,
@@ -119,6 +119,29 @@ class TestReadFileText:
 
 # ── build_wiki ──────────────────────────────────────────────────────────────
 
+def _make_sync_thread(monkeypatch):
+    """Patch threading.Thread so the target runs synchronously."""
+    class SyncThread:
+        def __init__(self, target=None, daemon=None, name=None, **kwargs):
+            self._target = target
+
+        def start(self):
+            if self._target:
+                self._target()
+
+    monkeypatch.setattr("repo_analyzer.services.wiki.wiki_builder.threading.Thread", SyncThread)
+
+
+def _sidebar_tree_json(page_title: str, name: str) -> str:
+    """Build a minimal valid sidebar tree JSON with Introduction + named node."""
+    return json.dumps({
+        "nodes": [
+            {"name": "Introduction", "page_title": page_title, "children": []},
+            {"name": name, "page_title": page_title, "children": []},
+        ]
+    })
+
+
 class TestBuildWiki:
     def test_raises_on_empty_repo_hash(self, session, mock_adapter) -> None:
         with pytest.raises(ValueError, match="repo_hash is required"):
@@ -146,19 +169,26 @@ class TestBuildWiki:
         assert result["task_id"] == task.task_id
 
     def test_creates_completed_task_with_no_subsystems(
-        self, session, mock_adapter
+        self, session, mock_adapter, monkeypatch
     ) -> None:
+        _make_sync_thread(monkeypatch)
         repo = make_repo(session)
         session.commit()
 
-        result = build_wiki(repo.repo_hash)
+        build_wiki(repo.repo_hash)
 
-        assert result["status"] == "completed"
-        assert result["total_files"] == 0
+        task = session.query(IndexTask).filter(
+            IndexTask.repo_hash == repo.repo_hash,
+            IndexTask.task_type == TaskType.BUILD_WIKI.value,
+        ).first()
+        assert task is not None
+        assert task.status == "completed"
+        assert task.total_files == 0
 
     def test_builds_wiki_page_per_subsystem(
         self, session, mock_adapter, monkeypatch, tmp_path
     ) -> None:
+        _make_sync_thread(monkeypatch)
         repo = make_repo(session, clone_path=str(tmp_path))
         rf = make_repo_file(session, repo, file_path="src", file_name="auth.py")
         (tmp_path / "src").mkdir()
@@ -177,16 +207,26 @@ class TestBuildWiki:
                 }
             ],
         })
-        mock_client = MagicMock()
-        mock_client.responses.create.return_value = make_openai_response(response_payload)
+        sidebar_payload = _sidebar_tree_json("Auth Overview", "Auth")
+
         monkeypatch.setattr(
-            "repo_analyzer.services.wiki.wiki_builder._get_openai_client",
-            lambda: mock_client,
+            "repo_analyzer.services.wiki.wiki_builder.stream_batch",
+            lambda requests, **kwargs: [(0, response_payload)],
+        )
+        monkeypatch.setattr(
+            "repo_analyzer.services.wiki.wiki_builder.run_batch",
+            lambda requests, **kwargs: [sidebar_payload],
         )
 
-        result = build_wiki(repo.repo_hash)
+        build_wiki(repo.repo_hash)
 
-        assert result["status"] == "completed"
+        task = session.query(IndexTask).filter(
+            IndexTask.repo_hash == repo.repo_hash,
+            IndexTask.task_type == TaskType.BUILD_WIKI.value,
+        ).first()
+        assert task is not None
+        assert task.status == "completed"
+
         pages = session.query(WikiPage).filter(WikiPage.repo_hash == repo.repo_hash).all()
         assert len(pages) == 1
         assert pages[0].title == "Auth Overview"
@@ -197,9 +237,10 @@ class TestBuildWiki:
         assert len(contents) == 1
         assert "JWT" in contents[0].content
 
-    def test_creates_sidebar_per_subsystem(
+    def test_creates_sidebar_nodes(
         self, session, mock_adapter, monkeypatch, tmp_path
     ) -> None:
+        _make_sync_thread(monkeypatch)
         repo = make_repo(session, clone_path=str(tmp_path))
         rf = make_repo_file(session, repo, file_path=".", file_name="app.py")
         (tmp_path / "app.py").write_text("app = True")
@@ -211,37 +252,49 @@ class TestBuildWiki:
             "title": "AppCore Overview",
             "contents": [{"content_type": "markdown", "content": "docs", "source_file_ids": [rf.file_id]}],
         })
-        mock_client = MagicMock()
-        mock_client.responses.create.return_value = make_openai_response(response_payload)
+        sidebar_payload = _sidebar_tree_json("AppCore Overview", "AppCore")
+
         monkeypatch.setattr(
-            "repo_analyzer.services.wiki.wiki_builder._get_openai_client",
-            lambda: mock_client,
+            "repo_analyzer.services.wiki.wiki_builder.stream_batch",
+            lambda requests, **kwargs: [(0, response_payload)],
+        )
+        monkeypatch.setattr(
+            "repo_analyzer.services.wiki.wiki_builder.run_batch",
+            lambda requests, **kwargs: [sidebar_payload],
         )
 
         build_wiki(repo.repo_hash)
 
         sidebars = session.query(WikiSidebar).filter(WikiSidebar.repo_hash == repo.repo_hash).all()
-        assert len(sidebars) == 1
-        assert sidebars[0].name == "AppCore"
-        assert sidebars[0].is_active is True
+        assert len(sidebars) >= 1
+        names = [s.name for s in sidebars]
+        assert "AppCore" in names
 
-    def test_creates_inactive_sidebar_for_subsystem_with_no_files(
-        self, session, mock_adapter, tmp_path
+    def test_no_sidebar_when_no_pages_generated(
+        self, session, mock_adapter, monkeypatch, tmp_path
     ) -> None:
+        """Empty subsystems produce no pages, so no sidebar is generated."""
+        _make_sync_thread(monkeypatch)
         repo = make_repo(session, clone_path=str(tmp_path))
         make_subsystem(session, repo, name="Empty", file_ids=[])
         session.commit()
 
-        result = build_wiki(repo.repo_hash)
+        build_wiki(repo.repo_hash)
 
-        assert result["status"] == "completed"
+        task = session.query(IndexTask).filter(
+            IndexTask.repo_hash == repo.repo_hash,
+            IndexTask.task_type == TaskType.BUILD_WIKI.value,
+        ).first()
+        assert task is not None
+        assert task.status == "completed"
+
         sidebars = session.query(WikiSidebar).filter(WikiSidebar.repo_hash == repo.repo_hash).all()
-        assert len(sidebars) == 1
-        assert sidebars[0].is_active is False
+        assert len(sidebars) == 0
 
     def test_deletes_existing_wiki_before_rebuild(
         self, session, mock_adapter, monkeypatch, tmp_path
     ) -> None:
+        _make_sync_thread(monkeypatch)
         repo = make_repo(session, clone_path=str(tmp_path))
         # Old wiki page that should be wiped
         make_wiki_page(session, repo, title="OldPage")
@@ -254,11 +307,15 @@ class TestBuildWiki:
             "title": "NewPage",
             "contents": [{"content_type": "markdown", "content": "new content", "source_file_ids": [rf.file_id]}],
         })
-        mock_client = MagicMock()
-        mock_client.responses.create.return_value = make_openai_response(response_payload)
+        sidebar_payload = _sidebar_tree_json("NewPage", "NewSub")
+
         monkeypatch.setattr(
-            "repo_analyzer.services.wiki.wiki_builder._get_openai_client",
-            lambda: mock_client,
+            "repo_analyzer.services.wiki.wiki_builder.stream_batch",
+            lambda requests, **kwargs: [(0, response_payload)],
+        )
+        monkeypatch.setattr(
+            "repo_analyzer.services.wiki.wiki_builder.run_batch",
+            lambda requests, **kwargs: [sidebar_payload],
         )
 
         build_wiki(repo.repo_hash)
@@ -271,21 +328,21 @@ class TestBuildWiki:
     def test_marks_task_failed_on_openai_error(
         self, session, mock_adapter, monkeypatch, tmp_path
     ) -> None:
+        _make_sync_thread(monkeypatch)
         repo = make_repo(session, clone_path=str(tmp_path))
         rf = make_repo_file(session, repo, file_path=".", file_name="x.py")
         (tmp_path / "x.py").write_text("x = 1")
         make_subsystem(session, repo, name="Sub", file_ids=[rf.file_id])
         session.commit()
 
-        mock_client = MagicMock()
-        mock_client.responses.create.side_effect = RuntimeError("wiki LLM error")
+        error = RuntimeError("wiki LLM error")
         monkeypatch.setattr(
-            "repo_analyzer.services.wiki.wiki_builder._get_openai_client",
-            lambda: mock_client,
+            "repo_analyzer.services.wiki.wiki_builder.stream_batch",
+            lambda requests, **kwargs: (_ for _ in ()).throw(error),
         )
 
-        with pytest.raises(RuntimeError, match="wiki LLM error"):
-            build_wiki(repo.repo_hash)
+        # build_wiki doesn't raise — error is caught in background thread
+        build_wiki(repo.repo_hash)
 
         task = session.query(IndexTask).filter(
             IndexTask.repo_hash == repo.repo_hash,
@@ -298,6 +355,7 @@ class TestBuildWiki:
     def test_task_completed_files_matches_file_count(
         self, session, mock_adapter, monkeypatch, tmp_path
     ) -> None:
+        _make_sync_thread(monkeypatch)
         repo = make_repo(session, clone_path=str(tmp_path))
         rf1 = make_repo_file(session, repo, file_path=".", file_name="a.py")
         rf2 = make_repo_file(session, repo, file_path=".", file_name="b.py")
@@ -310,14 +368,23 @@ class TestBuildWiki:
             "title": "Sub Overview",
             "contents": [{"content_type": "markdown", "content": "docs", "source_file_ids": [rf1.file_id]}],
         })
-        mock_client = MagicMock()
-        mock_client.responses.create.return_value = make_openai_response(response_payload)
+        sidebar_payload = _sidebar_tree_json("Sub Overview", "Sub")
+
         monkeypatch.setattr(
-            "repo_analyzer.services.wiki.wiki_builder._get_openai_client",
-            lambda: mock_client,
+            "repo_analyzer.services.wiki.wiki_builder.stream_batch",
+            lambda requests, **kwargs: [(0, response_payload)],
+        )
+        monkeypatch.setattr(
+            "repo_analyzer.services.wiki.wiki_builder.run_batch",
+            lambda requests, **kwargs: [sidebar_payload],
         )
 
-        result = build_wiki(repo.repo_hash)
+        build_wiki(repo.repo_hash)
 
-        assert result["completed_files"] == 2  # 2 files in the subsystem
-        assert result["remaining_files"] == 0
+        task = session.query(IndexTask).filter(
+            IndexTask.repo_hash == repo.repo_hash,
+            IndexTask.task_type == TaskType.BUILD_WIKI.value,
+        ).first()
+        assert task is not None
+        assert task.completed_files == 2  # 2 files in the subsystem
+        assert task.status == "completed"

@@ -1,6 +1,7 @@
 """Tests for repo_analyzer.services.file.code_analyzer."""
 
 import json
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -26,7 +27,6 @@ from repo_analyzer.services.file.code_analyzer import (
 )
 from tests.conftest import (
     make_index_task,
-    make_openai_response,
     make_repo,
     make_repo_file,
 )
@@ -163,15 +163,15 @@ class TestReadFileText:
 
 class TestBuildUserPrompt:
     def test_contains_file_path_and_content(self) -> None:
-        files = [FileForIndex(file_path="foo.py", file_name="foo.py", content="x = 1")]
+        files = [FileForIndex(file_path="foo.py", file_name="foo.py", content="x = 1", file_size_bytes=5)]
         prompt = _build_user_prompt(files)
         assert "foo.py" in prompt
         assert "x = 1" in prompt
 
     def test_contains_multiple_files(self) -> None:
         files = [
-            FileForIndex(file_path="a.py", file_name="a.py", content="a"),
-            FileForIndex(file_path="b.py", file_name="b.py", content="b"),
+            FileForIndex(file_path="a.py", file_name="a.py", content="a", file_size_bytes=1),
+            FileForIndex(file_path="b.py", file_name="b.py", content="b", file_size_bytes=1),
         ]
         prompt = _build_user_prompt(files)
         assert "FILE 1 PATH" in prompt
@@ -212,7 +212,7 @@ class TestFilterFilesToIndex:
 # ── _apply_summaries ────────────────────────────────────────────────────────
 
 class TestApplySummaries:
-    def test_sets_metadata_and_last_index_at(self, session, engine) -> None:
+    def test_sets_metadata_and_last_index_at(self, session, engine, tmp_path) -> None:
         repo = make_repo(session)
         rf = make_repo_file(session, repo, file_name="x.py")
         task = make_index_task(session, repo, total_files=1, completed_files=0)
@@ -228,19 +228,19 @@ class TestApplySummaries:
         rf.file_name = "x.py"
         session.flush()
 
-        _apply_summaries(session, task, [rf], summaries)
+        _apply_summaries(session, task, [rf], summaries, repo_root=tmp_path)
 
         assert rf.last_index_at > 0
         assert rf.get_metadata() is not None
         assert rf.get_metadata()["responsibility"] == "does stuff"
         assert task.completed_files == 1
 
-    def test_skips_file_with_no_matching_summary(self, session, engine) -> None:
+    def test_skips_file_with_no_matching_summary(self, session, engine, tmp_path) -> None:
         repo = make_repo(session)
         rf = make_repo_file(session, repo, file_name="z.py")
         task = make_index_task(session, repo, total_files=1, completed_files=0)
 
-        _apply_summaries(session, task, [rf], [])  # empty summaries
+        _apply_summaries(session, task, [rf], [], repo_root=tmp_path)  # empty summaries
 
         assert task.completed_files == 0
         assert rf.last_index_at == 0
@@ -257,14 +257,12 @@ class TestIndexFile:
             "dependent_files": [],
             "entry_point": True,
         }])
-        mock_client = MagicMock()
-        mock_client.responses.create.return_value = make_openai_response(response_json)
         monkeypatch.setattr(
-            "repo_analyzer.services.file.code_analyzer._get_openai_client",
-            lambda: mock_client,
+            "repo_analyzer.services.file.code_analyzer.run_batch",
+            lambda requests, **kwargs: [response_json],
         )
 
-        files = [FileForIndex(file_path="app.py", file_name="app.py", content="x=1")]
+        files = [FileForIndex(file_path="app.py", file_name="app.py", content="x=1", file_size_bytes=3)]
         results = index_file(files)
 
         assert len(results) == 1
@@ -274,23 +272,38 @@ class TestIndexFile:
     def test_returns_empty_list_for_no_files(self) -> None:
         assert index_file([]) == []
 
-    def test_raises_when_summary_count_mismatches(self, monkeypatch) -> None:
+    def test_reconciles_when_summary_count_mismatches(self, monkeypatch) -> None:
+        # When LLM returns more summaries than files, best-effort reconciliation is used
         response_json = json.dumps([
             {"file_path": "a.py", "responsibility": "r", "key_elements": [], "dependent_files": [], "entry_point": False},
             {"file_path": "b.py", "responsibility": "r", "key_elements": [], "dependent_files": [], "entry_point": False},
         ])
-        mock_client = MagicMock()
-        mock_client.responses.create.return_value = make_openai_response(response_json)
         monkeypatch.setattr(
-            "repo_analyzer.services.file.code_analyzer._get_openai_client",
-            lambda: mock_client,
+            "repo_analyzer.services.file.code_analyzer.run_batch",
+            lambda requests, **kwargs: [response_json],
         )
-        files = [FileForIndex(file_path="a.py", file_name="a.py", content="x")]
-        with pytest.raises(ValueError, match="Expected 1 summaries"):
-            index_file(files)
+        files = [FileForIndex(file_path="a.py", file_name="a.py", content="x", file_size_bytes=1)]
+        # Should not raise — logs warning and reconciles
+        results = index_file(files)
+        assert len(results) == 1
 
 
 # ── index_repo ──────────────────────────────────────────────────────────────
+
+def _make_sync_thread(monkeypatch):
+    """Patch threading.Thread so the target runs synchronously in the same thread."""
+    real_thread = threading.Thread
+
+    class SyncThread:
+        def __init__(self, target=None, daemon=None, name=None, **kwargs):
+            self._target = target
+
+        def start(self):
+            if self._target:
+                self._target()
+
+    monkeypatch.setattr("repo_analyzer.services.file.code_analyzer.threading.Thread", SyncThread)
+
 
 class TestIndexRepo:
     def test_raises_when_repo_not_found(self, session, mock_adapter) -> None:
@@ -325,9 +338,10 @@ class TestIndexRepo:
         assert result["status"] == "completed"
         assert result["total_files"] == 0
 
-    def test_indexes_files_and_returns_completed_status(
+    def test_indexes_files_and_completes(
         self, session, mock_adapter, monkeypatch, tmp_path
     ) -> None:
+        _make_sync_thread(monkeypatch)
         repo = make_repo(session, clone_path=str(tmp_path))
         # Create the actual file on disk
         (tmp_path / "src").mkdir()
@@ -343,36 +357,39 @@ class TestIndexRepo:
             "dependent_files": [],
             "entry_point": True,
         }])
-        mock_client = MagicMock()
-        mock_client.responses.create.return_value = make_openai_response(response_json)
         monkeypatch.setattr(
-            "repo_analyzer.services.file.code_analyzer._get_openai_client",
-            lambda: mock_client,
+            "repo_analyzer.services.file.code_analyzer.stream_batch",
+            lambda requests, **kwargs: [(0, response_json)],
         )
 
-        result = index_repo(repo.repo_hash, batch_size=8)
+        index_repo(repo.repo_hash, batch_size=8)
 
-        assert result["status"] == "completed"
-        assert result["completed_files"] == 1
-        assert result["remaining_files"] == 0
+        # SyncThread runs the background work synchronously, so DB is updated.
+        task = session.query(IndexTask).filter(
+            IndexTask.repo_hash == repo.repo_hash,
+            IndexTask.task_type == TaskType.INDEX_FILE.value,
+        ).first()
+        assert task is not None
+        assert task.status == "completed"
+        assert task.completed_files == 1
 
     def test_marks_task_failed_on_openai_error(
         self, session, mock_adapter, monkeypatch, tmp_path
     ) -> None:
+        _make_sync_thread(monkeypatch)
         repo = make_repo(session, clone_path=str(tmp_path))
         (tmp_path / "err.py").write_text("boom")
         make_repo_file(session, repo, file_path=".", file_name="err.py", last_index_at=0)
         session.commit()
 
-        mock_client = MagicMock()
-        mock_client.responses.create.side_effect = RuntimeError("OpenAI down")
+        error = RuntimeError("OpenAI down")
         monkeypatch.setattr(
-            "repo_analyzer.services.file.code_analyzer._get_openai_client",
-            lambda: mock_client,
+            "repo_analyzer.services.file.code_analyzer.stream_batch",
+            lambda requests, **kwargs: (_ for _ in ()).throw(error),
         )
 
-        with pytest.raises(RuntimeError, match="OpenAI down"):
-            index_repo(repo.repo_hash)
+        # index_repo itself won't raise — the error is caught in the background thread
+        index_repo(repo.repo_hash)
 
         # Task should be marked failed in DB
         task = session.query(IndexTask).filter(
