@@ -6,12 +6,12 @@
 
 SUBSYSTEM_BATCH_SYSTEM_PROMPT: str = (
     "You are analyzing a repository's file listing to create initial groupings "
-    "for hierarchical subsystem clustering.\n\n"
+    "for developer-facing wiki generation.\n\n"
     "Goal:\n"
-    "- Group related files into batches based on directory structure, naming "
-    "conventions, and likely functional relationships.\n"
-    "- Each batch should contain files that are likely to form one or more "
-    "subsystems together.\n"
+    "- Group files into batches that correspond to coherent product features, "
+    "capabilities, or functional areas a developer would reason about.\n"
+    "- Think from a new engineer's perspective: what groups of files would I read "
+    "together to understand one thing the system does?\n"
     "- Return at most {max_batches} batches.\n"
     "- Every file_id from the input must appear in exactly one batch.\n"
     "- Do not omit any file_ids.\n\n"
@@ -22,9 +22,10 @@ SUBSYSTEM_BATCH_SYSTEM_PROMPT: str = (
     "}}\n\n"
     "Rules:\n"
     "- Use only the provided file_ids.\n"
-    "- Group by functional similarity, not only by directory.\n"
-    "- Project files (is_project_file=true) and entry points (entry_point=true) "
-    "should guide how you form groups.\n"
+    "- Prefer functional/feature groupings over directory-based groupings.\n"
+    "- Entry points (entry_point=true) and project files (is_project_file=true) "
+    "anchor the groups they belong to.\n"
+    "- Shared utilities and helpers belong with the feature that most depends on them.\n"
     "- Return only JSON.\n"
 )
 
@@ -33,12 +34,16 @@ SUBSYSTEM_BATCH_SYSTEM_PROMPT: str = (
 # Returns 1+ subsystem specs per batch.
 
 SUBSYSTEM_CLUSTER_SYSTEM_PROMPT: str = (
-    "You are analyzing a batch of repository files to define subsystems.\n\n"
+    "You are analyzing a batch of repository files to define subsystems for a "
+    "developer-facing wiki.\n\n"
     "Goal:\n"
-    "- From the files provided, identify one or more meaningful subsystems.\n"
-    "- Identify subsystems from a user-facing, feature-driven perspective.\n"
-    "- Each subsystem must have a concise name, a 1-2 sentence description,\n"
-    "  a list of keywords, and the list of file_ids it contains.\n"
+    "- Identify one or more subsystems that represent distinct product capabilities "
+    "or functional areas, as a new engineer would understand them.\n"
+    "- Name each subsystem after what it does for the user/developer, not after its "
+    "internal implementation layer (e.g. 'Repository Indexing' not 'FileScanner', "
+    "'Authentication' not 'auth_middleware').\n"
+    "- Choose keywords that reflect the feature domain: API names, data concepts, "
+    "user-visible actions, configuration knobs.\n"
     "- A file should belong to exactly one subsystem.\n\n"
     "Return JSON array. Each item:\n"
     "{\n"
@@ -48,10 +53,10 @@ SUBSYSTEM_CLUSTER_SYSTEM_PROMPT: str = (
     '  "file_ids": []\n'
     "}\n\n"
     "Rules:\n"
-    "- Use provided file_ids only.\n"
-    "- Do not invent files.\n"
+    "- Use provided file_ids only; do not invent files.\n"
     "- A batch may produce 1 or more subsystems.\n"
-    "- Files can belong to only one subsystem.\n"
+    "- Subsystem names must be concise (2-4 words) and user-facing.\n"
+    "- Descriptions must be 1-2 sentences explaining capability, not implementation.\n"
     "- Return only JSON.\n"
 )
 
@@ -60,11 +65,15 @@ SUBSYSTEM_CLUSTER_SYSTEM_PROMPT: str = (
 # Returns merged list + continue_merging flag.
 
 SUBSYSTEM_MERGE_SYSTEM_PROMPT: str = (
-    "You are reviewing subsystems of a repository and merging related ones.\n\n"
+    "You are consolidating subsystems of a repository into a final set that will "
+    "become wiki pages for onboarding new engineers.\n\n"
     "Goal:\n"
-    "- Merge subsystems that are closely related or overlapping.\n"
-    "- Combine their file_ids and keywords. Write a new merged description.\n"
-    "- Keep subsystems that are genuinely distinct.\n"
+    "- Merge subsystems that cover the same product capability or are too small to "
+    "warrant their own wiki page.\n"
+    "- Keep subsystems that represent genuinely distinct features or concerns that "
+    "a developer would want to read about separately.\n"
+    "- After merging, rewrite the name and description to reflect the broader combined "
+    "capability in user-facing terms.\n"
     "- Target at most {max_final} final subsystems.\n\n"
     "Return JSON object:\n"
     "{{\n"
@@ -79,9 +88,11 @@ SUBSYSTEM_MERGE_SYSTEM_PROMPT: str = (
     '  "continue_merging": true\n'
     "}}\n\n"
     "Rules:\n"
-    "- Preserve all file_ids. Do not drop any.\n"
-    "- Set continue_merging to true if further consolidation would help.\n"
-    "- Set continue_merging to false if the subsystems are already well-formed.\n"
+    "- Preserve all file_ids across the merged set; do not drop any.\n"
+    "- Merged subsystem names must remain concise (2-4 words) and capability-focused.\n"
+    "- Set continue_merging to true if subsystems are still too granular or overlapping.\n"
+    "- Set continue_merging to false once each subsystem maps cleanly to one coherent "
+    "topic a developer would read as a single wiki page.\n"
     "- Return only JSON.\n"
 )
 

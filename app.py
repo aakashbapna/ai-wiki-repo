@@ -1,8 +1,10 @@
 import logging
+import threading
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 import openai._utils._logs
 openai._utils._logs.logger.setLevel(logging.WARNING)
 openai._utils._logs.httpx_logger.setLevel(logging.WARNING)
@@ -13,7 +15,10 @@ from repo_analyzer.db import get_default_adapter
 from repo_analyzer import clone_repo, index_repo
 from repo_analyzer.services import FileService, RepoService, SubsystemService, WikiService
 
-app = Flask(__name__)
+BASE_DIR = Path(__file__).resolve().parent
+FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
+
+app = Flask(__name__, static_folder=None)
 logging.basicConfig(level=logging.DEBUG)
 
 logger = logging.getLogger(__name__)
@@ -117,7 +122,7 @@ def list_repo_files(repo_hash_: str) -> tuple:
 
 @app.route("/api/repos/<string:repo_hash_>/index", methods=["POST"])
 def index_repo_endpoint(repo_hash_: str) -> tuple:
-    """Start or resume repo indexing and return task status."""
+    """Start repo indexing and return immediately; heavy work runs in background."""
     try:
         logger.info("Index repo requested: %s", repo_hash_)
         status = index_repo(repo_hash_)
@@ -367,6 +372,22 @@ def openai_health() -> tuple:
     except Exception as e:
         logger.exception("OpenAI health failed.")
         return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_frontend(path: str) -> object:
+    if FRONTEND_DIST.exists() and path:
+        if path.startswith("assets/"):
+            asset_path = FRONTEND_DIST / path
+            if asset_path.is_file():
+                return send_from_directory(FRONTEND_DIST, path)
+        file_path = FRONTEND_DIST / path
+        if file_path.is_file():
+            return send_from_directory(FRONTEND_DIST, path)
+    if FRONTEND_DIST.exists():
+        return send_from_directory(FRONTEND_DIST, "index.html")
+    return jsonify({"error": "Frontend build not found."}), 404
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -74,15 +75,34 @@ class PageSummary:
     keywords: list[str]
 
 
+@dataclass(frozen=True)
+class SubsystemSnapshot:
+    """Plain-data snapshot of a RepoSubsystem; safe to share across threads."""
+    subsystem_id: int
+    name: str
+    description: str
+    file_ids: list[int]
+    meta_json: str | None
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
 def build_wiki(repo_hash: str, *, model: str = "gpt-5-mini") -> WikiTaskStatus:
+    """Start a wiki build and return the task status immediately.
+
+    The heavy work (LLM calls, page generation, sidebar) runs in a daemon
+    thread so the caller is never blocked waiting for completion.  Poll the
+    task status endpoint to track progress.
+    """
     if not repo_hash.strip():
         raise ValueError("repo_hash is required")
 
     adapter = get_default_adapter()
+
+    # ── Phase 0: read repo + guard against duplicate runs ────────────────────
+    # Short-lived session — closes before any worker threads start.
     with adapter.session() as session:
         repo_manager = RepoManager(session)
         repo = repo_manager.get_by_hash(repo_hash)
@@ -95,19 +115,39 @@ def build_wiki(repo_hash: str, *, model: str = "gpt-5-mini") -> WikiTaskStatus:
             if is_task_stale(existing, timeout_seconds=STALE_TASK_TIMEOUT_SECONDS, now=now):
                 logger.warning(
                     "Wiki task stale repo_hash=%s task_id=%d updated_at=%d",
-                    repo_hash,
-                    existing.task_id,
-                    existing.updated_at,
+                    repo_hash, existing.task_id, existing.updated_at,
                 )
                 existing.status = TaskStatus.STALE.value
                 existing.updated_at = now
                 existing.last_error = "Marked stale due to missing heartbeat."
-                session.commit()
+                # session auto-commits on __exit__
             else:
+                # A healthy build is already running — return its current status.
                 return _task_status(existing)
 
         subsystems = _list_subsystems(session, repo_hash)
         total_files = sum(len((s.get_meta() or {}).get("file_ids", [])) for s in subsystems)
+
+        # Snapshot plain data before the session closes.
+        repo_full_name = repo.full_name
+        repo_clone_path = repo.clone_path_resolved
+
+        snapshots: list[SubsystemSnapshot] = []
+        for s in subsystems:
+            meta = s.get_meta() or {}
+            file_ids = [int(x) for x in (meta.get("file_ids") or [])]
+            snapshots.append(SubsystemSnapshot(
+                subsystem_id=s.subsystem_id,
+                name=s.name,
+                description=s.description,
+                file_ids=file_ids,
+                meta_json=s.meta_json,
+            ))
+
+    # ── Phase 0b: delete old wiki data + create task record ──────────────────
+    # Own session, commits and closes immediately — DB fully unlocked afterward.
+    with adapter.session() as session:
+        WikiManager(session).delete_by_repo(repo_hash)
         task = IndexTask(
             repo_hash=repo_hash,
             task_type=TaskType.BUILD_WIKI.value,
@@ -119,22 +159,47 @@ def build_wiki(repo_hash: str, *, model: str = "gpt-5-mini") -> WikiTaskStatus:
         )
         session.add(task)
         session.flush()
+        task_id = task.task_id
+        initial_status = _task_status(task)
+        # session auto-commits on __exit__
 
+    # ── Phases 1-3: run entirely in a background daemon thread ───────────────
+    # The caller returns `initial_status` immediately.  The thread does the
+    # LLM work (one session per page write, all short-lived) then marks done.
+    def _background() -> None:
+        build_failed = False
+        build_error = ""
         try:
-            _rebuild_wiki(session, repo, subsystems, task, model=model)
-            # Reload task to pick up completed_files written by worker sessions.
-            session.expire(task)
-            task.status = TaskStatus.COMPLETED.value
-            task.updated_at = int(time.time())
-            session.commit()
+            _rebuild_wiki(
+                repo_hash=repo_hash,
+                repo_full_name=repo_full_name,
+                repo_clone_path=repo_clone_path,
+                snapshots=snapshots,
+                task_id=task_id,
+                model=model,
+            )
         except Exception as exc:
-            task.status = TaskStatus.FAILED.value
-            task.updated_at = int(time.time())
-            task.last_error = str(exc)
-            session.commit()
-            raise
+            build_failed = True
+            build_error = str(exc)
+            logger.exception("Wiki build failed repo_hash=%s: %s", repo_hash, exc)
 
-        return _task_status(task)
+        with adapter.session() as fin_session:
+            db_task = fin_session.query(IndexTask).filter(IndexTask.task_id == task_id).one()
+            db_task.status = TaskStatus.FAILED.value if build_failed else TaskStatus.COMPLETED.value
+            if build_failed:
+                db_task.last_error = build_error
+            db_task.updated_at = int(time.time())
+            # fin_session auto-commits on __exit__
+
+        logger.info("Wiki build finished repo_hash=%s failed=%s", repo_hash, build_failed)
+
+    threading.Thread(
+        target=_background,
+        daemon=True,
+        name=f"wiki-build-{repo_hash[:8]}",
+    ).start()
+
+    return initial_status
 
 
 # ---------------------------------------------------------------------------
@@ -142,76 +207,49 @@ def build_wiki(repo_hash: str, *, model: str = "gpt-5-mini") -> WikiTaskStatus:
 # ---------------------------------------------------------------------------
 
 def _rebuild_wiki(
-    session: Session,
-    repo: Repo,
-    subsystems: list[RepoSubsystem],
-    task: IndexTask,
     *,
+    repo_hash: str,
+    repo_full_name: str,
+    repo_clone_path: Path,
+    snapshots: list[SubsystemSnapshot],
+    task_id: int,
     model: str,
 ) -> None:
     """
     Phase 1: Generate one wiki page per subsystem concurrently.
+             Each worker uses its own short-lived DB session that commits and
+             closes immediately — no outer session is held open.
     Phase 2: Single LLM call to organize pages into a sidebar tree.
     """
     adapter = get_default_adapter()
-    repo_hash = repo.repo_hash
-    task_id = task.task_id
-
-    # Delete existing wiki data and commit so worker threads can acquire the
-    # write lock immediately instead of waiting for the outer session to close.
-    WikiManager(session).delete_by_repo(repo_hash)
-    session.commit()
-
-    # Snapshot plain data from ORM objects so workers don't share session state.
-    @dataclass(frozen=True)
-    class SubsystemSnapshot:
-        subsystem_id: int
-        name: str
-        description: str
-        file_ids: list[int]
-        meta_json: str | None
-
-    snapshots: list[SubsystemSnapshot] = []
-    for s in subsystems:
-        meta = s.get_meta() or {}
-        file_ids = [int(x) for x in (meta.get("file_ids") or [])]
-        snapshots.append(SubsystemSnapshot(
-            subsystem_id=s.subsystem_id,
-            name=s.name,
-            description=s.description,
-            file_ids=file_ids,
-            meta_json=s.meta_json,
-        ))
-
-    repo_full_name = repo.full_name
-    repo_clone_path = repo.clone_path_resolved
 
     def _process_subsystem(snap: SubsystemSnapshot) -> PageSummary | None:
         """Generate and persist one wiki page inside its own DB session.
 
         Returns PageSummary for sidebar generation, or None for empty subsystems.
         """
-        with adapter.session() as write_session:
-            wiki_manager = WikiManager(write_session)
+        if not snap.file_ids:
+            return None
 
-            if not snap.file_ids:
-                # No files → no page → skip (sidebar handled in Phase 2)
-                return None
-
+        # ── LLM call (no DB session held) ─────────────────────────────────────
+        with adapter.session() as read_session:
             db_files: list[RepoFile] = (
-                write_session.query(RepoFile)
+                read_session.query(RepoFile)
                 .filter(RepoFile.repo_hash == repo_hash, RepoFile.file_id.in_(snap.file_ids))
                 .all()
             )
 
-            page_spec = _generate_page_from_snapshot(
-                repo_full_name=repo_full_name,
-                repo_clone_path=repo_clone_path,
-                snap=snap,
-                files=db_files,
-                model=model,
-            )
+        page_spec = _generate_page_from_snapshot(
+            repo_full_name=repo_full_name,
+            repo_clone_path=repo_clone_path,
+            snap=snap,
+            files=db_files,
+            model=model,
+        )
 
+        # ── Write page + contents (own session, commits immediately) ───────────
+        with adapter.session() as write_session:
+            wiki_manager = WikiManager(write_session)
             page = wiki_manager.add_page(
                 repo_hash=repo_hash,
                 title=page_spec["title"],
@@ -219,8 +257,7 @@ def _rebuild_wiki(
             )
             write_session.flush()
 
-            content_nodes = page_spec.get("contents") or []
-            for node in content_nodes:
+            for node in (page_spec.get("contents") or []):
                 wiki_manager.add_content(
                     page_id=page.page_id,
                     title=node["title"],
@@ -229,30 +266,33 @@ def _rebuild_wiki(
                     source_file_ids=node["source_file_ids"],
                 )
 
-            db_task = write_session.query(IndexTask).filter(
+            page_id = page.page_id
+            # session auto-commits on __exit__
+
+        # ── Update task progress (own session, commits immediately) ────────────
+        with adapter.session() as task_session:
+            db_task = task_session.query(IndexTask).filter(
                 IndexTask.task_id == task_id
             ).one()
             db_task.completed_files += len(snap.file_ids)
             db_task.updated_at = int(time.time())
-            write_session.commit()
-            logger.info(
-                "Wiki page written subsystem=%r repo_hash=%s",
-                snap.name, repo_hash,
-            )
+            # session auto-commits on __exit__
 
-            # Extract keywords from snapshot meta
-            meta = json.loads(snap.meta_json) if snap.meta_json else {}
-            keywords_raw = meta.get("keywords", [])
-            keywords = keywords_raw if isinstance(keywords_raw, list) else []
+        logger.info("Wiki page saved subsystem=%r page_id=%d repo_hash=%s",
+                    snap.name, page_id, repo_hash)
 
-            return PageSummary(
-                page_id=page.page_id,
-                title=page_spec["title"],
-                subsystem_id=snap.subsystem_id,
-                subsystem_name=snap.name,
-                subsystem_description=snap.description,
-                keywords=[str(k) for k in keywords],
-            )
+        meta = json.loads(snap.meta_json) if snap.meta_json else {}
+        keywords_raw = meta.get("keywords", [])
+        keywords = keywords_raw if isinstance(keywords_raw, list) else []
+
+        return PageSummary(
+            page_id=page_id,
+            title=page_spec["title"],
+            subsystem_id=snap.subsystem_id,
+            subsystem_name=snap.name,
+            subsystem_description=snap.description,
+            keywords=[str(k) for k in keywords],
+        )
 
     # Phase 1: Generate wiki pages concurrently
     page_summaries: list[PageSummary] = []
@@ -296,12 +336,6 @@ _INTRO_SIGNALS = frozenset([
     "welcome", "guide", "quickstart", "start", "begin", "entry",
 ])
 
-_ARCH_SIGNALS = frozenset([
-    "architecture", "design", "structure", "system", "diagram", "flow",
-    "infrastructure", "layout", "topology", "pipeline", "framework", "core",
-    "engine", "platform", "model", "schema", "data model",
-])
-
 
 def _score_page(ps: PageSummary, signals: frozenset[str]) -> int:
     """Return a relevance score for a page against a set of signal words."""
@@ -324,22 +358,12 @@ def _build_sidebar_user_prompt(
 ) -> str:
     """Build the user prompt for sidebar tree generation.
 
-    Identifies the best candidates for the mandatory Introduction and Architecture
-    nodes so the LLM can assign them without guessing.
+    Identifies the best candidate for the mandatory Introduction node so the
+    LLM can assign it without guessing.
     """
-    # Score each page for intro and architecture fit
     intro_candidate: PageSummary | None = None
-    arch_candidate: PageSummary | None = None
-
     if page_summaries:
-        intro_ranked = sorted(page_summaries, key=lambda p: _score_page(p, _INTRO_SIGNALS), reverse=True)
-        arch_ranked = sorted(page_summaries, key=lambda p: _score_page(p, _ARCH_SIGNALS), reverse=True)
-        intro_candidate = intro_ranked[0]
-        # Architecture candidate should be different from intro candidate if possible
-        arch_candidate = next(
-            (p for p in arch_ranked if p.page_id != intro_candidate.page_id),
-            arch_ranked[0],
-        )
+        intro_candidate = max(page_summaries, key=lambda p: _score_page(p, _INTRO_SIGNALS))
 
     lines: list[str] = []
     lines.append(f"Organize these {len(page_summaries)} wiki pages into a sidebar tree.")
@@ -349,8 +373,6 @@ def _build_sidebar_user_prompt(
 
     if intro_candidate:
         lines.append(f"INTRO_CANDIDATE: {intro_candidate.title}")
-    if arch_candidate:
-        lines.append(f"ARCH_CANDIDATE: {arch_candidate.title}")
     lines.append("")
 
     lines.append("PAGES:")
@@ -408,15 +430,14 @@ def _parse_sidebar_tree(
     max_top_nodes: int,
     max_children: int,
     intro_candidate: PageSummary | None = None,
-    arch_candidate: PageSummary | None = None,
     title_to_subsystem_ids: dict[str, list[int]] | None = None,
 ) -> SidebarTreeSpec:
     """Parse LLM response into a validated SidebarTreeSpec.
 
     Truncates to max_top_nodes top-level and max_children per node.
     Validates page_title references against valid_titles.
-    Ensures mandatory 'Introduction' and 'Architecture' nodes exist,
-    assigning best-fit pages when the LLM omits them.
+    Ensures the mandatory 'Introduction' node is always first, assigning the
+    best-fit page when the LLM omits it.
     """
     parsed = json.loads(text)
     if not isinstance(parsed, dict):
@@ -435,26 +456,23 @@ def _parse_sidebar_tree(
 
     sub_ids_map = title_to_subsystem_ids or {}
 
-    def _make_mandatory_node(name: str, candidate: PageSummary | None) -> SidebarNodeSpec:
-        """Build a mandatory node, assigning the candidate page if available."""
-        if candidate and candidate.title in valid_titles:
-            return SidebarNodeSpec(
-                name=name,
-                page_title=candidate.title,
-                subsystem_ids=sub_ids_map.get(candidate.title, [candidate.subsystem_id]),
-                children=[],
-            )
-        return SidebarNodeSpec(name=name, page_title=None, subsystem_ids=[], children=[])
-
-    # Ensure mandatory nodes exist (Introduction first, Architecture second)
+    # Ensure the mandatory Introduction node is always first
     node_names = [n["name"].lower() for n in nodes]
     if "introduction" not in node_names:
-        nodes.insert(0, _make_mandatory_node("Introduction", intro_candidate))
-    if "architecture" not in node_names:
-        intro_idx = next(
-            (i for i, n in enumerate(nodes) if n["name"].lower() == "introduction"), 0
-        )
-        nodes.insert(intro_idx + 1, _make_mandatory_node("Architecture", arch_candidate))
+        if intro_candidate and intro_candidate.title in valid_titles:
+            intro_node: SidebarNodeSpec = SidebarNodeSpec(
+                name="Introduction",
+                page_title=intro_candidate.title,
+                subsystem_ids=sub_ids_map.get(
+                    intro_candidate.title, [intro_candidate.subsystem_id]
+                ),
+                children=[],
+            )
+        else:
+            intro_node = SidebarNodeSpec(
+                name="Introduction", page_title=None, subsystem_ids=[], children=[]
+            )
+        nodes.insert(0, intro_node)
 
     # Re-enforce max_top_nodes after mandatory insertion
     nodes = nodes[:max_top_nodes]
@@ -552,17 +570,10 @@ def _generate_and_save_sidebar_tree(
 
     valid_titles = set(title_to_page.keys())
 
-    # Identify best candidates for mandatory nodes (same logic as user prompt)
+    # Identify best candidate for the mandatory Introduction node (same logic as user prompt)
     intro_candidate: PageSummary | None = None
-    arch_candidate: PageSummary | None = None
     if page_summaries:
-        intro_ranked = sorted(page_summaries, key=lambda p: _score_page(p, _INTRO_SIGNALS), reverse=True)
-        arch_ranked = sorted(page_summaries, key=lambda p: _score_page(p, _ARCH_SIGNALS), reverse=True)
-        intro_candidate = intro_ranked[0]
-        arch_candidate = next(
-            (p for p in arch_ranked if p.page_id != intro_candidate.page_id),
-            arch_ranked[0],
-        )
+        intro_candidate = max(page_summaries, key=lambda p: _score_page(p, _INTRO_SIGNALS))
 
     # Build and send prompt
     user_prompt = _build_sidebar_user_prompt(repo_full_name, page_summaries)
@@ -584,7 +595,6 @@ def _generate_and_save_sidebar_tree(
             max_top_nodes=WIKI_SIDEBAR_MAX_TOP_NODES,
             max_children=WIKI_SIDEBAR_MAX_CHILDREN,
             intro_candidate=intro_candidate,
-            arch_candidate=arch_candidate,
             title_to_subsystem_ids=title_to_subsystem_ids,
         )
     except (json.JSONDecodeError, ValueError) as exc:
@@ -826,6 +836,9 @@ def _escape_invalid_backslashes(text: str) -> str:
     return _INVALID_ESCAPE_RE.sub(r"\\\\", text)
 
 
+_CONTENT_NODE_MAX_CHARS: int = 2000
+
+
 def _normalize_page_spec(item: dict[str, object]) -> WikiPageSpec:
     title = str(item.get("title") or "").strip()
     contents_raw = item.get("contents")
@@ -837,17 +850,45 @@ def _normalize_page_spec(item: dict[str, object]) -> WikiPageSpec:
             node_title = str(node.get("title") or "").strip()
             content_type = str(node.get("content_type") or "markdown")
             content = str(node.get("content") or "")
+            # Hard cap: split oversized nodes rather than silently truncating.
+            chunks = _split_content(content, max_chars=_CONTENT_NODE_MAX_CHARS)
             source_file_ids = _ensure_int_list(node.get("source_file_ids"))
-            contents.append({
-                "title": node_title,
-                "content_type": content_type,
-                "content": content,
-                "source_file_ids": source_file_ids,
-            })
+            for idx, chunk in enumerate(chunks):
+                chunk_title = node_title if idx == 0 else f"{node_title} (cont.)"
+                contents.append({
+                    "title": chunk_title,
+                    "content_type": content_type,
+                    "content": chunk,
+                    "source_file_ids": source_file_ids,
+                })
     return {
         "title": title or "Subsystem Overview",
         "contents": contents,
     }
+
+
+def _split_content(text: str, *, max_chars: int) -> list[str]:
+    """Split content into chunks of at most max_chars, breaking on paragraph boundaries."""
+    if len(text) <= max_chars:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > max_chars:
+        # Try to split at the last blank line within the limit
+        window = remaining[:max_chars]
+        split_pos = window.rfind("\n\n")
+        if split_pos == -1:
+            # No paragraph break — fall back to last newline
+            split_pos = window.rfind("\n")
+        if split_pos == -1:
+            # No newline at all — hard cut
+            split_pos = max_chars
+        chunks.append(remaining[:split_pos].rstrip())
+        remaining = remaining[split_pos:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
 
 
 def _ensure_int_list(value: object) -> list[int]:

@@ -144,6 +144,41 @@ export default function HomePage(): JSX.Element {
     }
   };
 
+  const refreshIngestStatus = async (): Promise<void> => {
+    if (!ingestStatus.index && !ingestStatus.subsystem && !ingestStatus.wiki) {
+      return;
+    }
+    if (!repoUrl.trim()) {
+      return;
+    }
+    setIngestError(null);
+    try {
+      const repo = await fetchRepo(repoUrl.trim());
+      const repoHash = repo.repo_hash;
+      try {
+        const index = await fetchIndexStatus(repoHash);
+        setIngestStatus((prev) => ({ ...prev, index }));
+      } catch {
+        setIngestStatus((prev) => ({ ...prev, index: prev.index }));
+      }
+      try {
+        const subsystem = await fetchSubsystemStatus(repoHash);
+        setIngestStatus((prev) => ({ ...prev, subsystem }));
+      } catch {
+        setIngestStatus((prev) => ({ ...prev, subsystem: prev.subsystem }));
+      }
+      try {
+        const wiki = await fetchWikiStatus(repoHash);
+        setIngestStatus((prev) => ({ ...prev, wiki }));
+      } catch {
+        setIngestStatus((prev) => ({ ...prev, wiki: prev.wiki }));
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to refresh status.";
+      setIngestError(message);
+    }
+  };
+
   return (
     <section>
       <div className="mb-8 flex flex-col gap-6">
@@ -180,6 +215,15 @@ export default function HomePage(): JSX.Element {
             <div>Indexing: {formatProgress(ingestStatus.index)}</div>
             <div>Subsystems: {formatProgress(ingestStatus.subsystem)}</div>
             <div>Wiki: {formatProgress(ingestStatus.wiki)}</div>
+          </div>
+          <div className="mt-3">
+            <button
+              type="button"
+              onClick={refreshIngestStatus}
+              className="text-xs font-semibold text-accentDark hover:underline"
+            >
+              Refresh Status
+            </button>
           </div>
           {ingestMessage && (
             <p className="mt-3 text-sm text-accentDark">{ingestMessage}</p>

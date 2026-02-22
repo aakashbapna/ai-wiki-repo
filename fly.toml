@@ -1,0 +1,30 @@
+# fly.toml app configuration file generated for ai-repo-wiki on 2026-02-22T10:39:54+05:30
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'ai-repo-wiki'
+primary_region = 'lhr'
+
+[build]
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ['app']
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 1024
+
+[mounts]
+source = "volume_ai_repo_wiki"
+destination = "/data"
+
+[env]
+DATA_DIR="/data"

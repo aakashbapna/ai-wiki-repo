@@ -1,0 +1,8 @@
+fly.toml
+.git/
+__pycache__/
+.envrc
+.venv/
+data/
+frontend/node_modules
+
