@@ -9,11 +9,9 @@ import json
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import TypedDict
 
-from openai import OpenAI
 from sqlalchemy.orm import Session
 
 from constants import (
@@ -25,13 +23,14 @@ from constants import (
 )
 from repo_analyzer.db import get_default_adapter
 from repo_analyzer.db_managers import RepoManager, SubsystemManager
-from repo_analyzer.models import IndexTask, Repo, RepoFile
+from repo_analyzer.models import IndexTask, RepoFile
 from repo_analyzer.models.index_task import TaskProgress, TaskStatus, TaskType, is_task_stale
 from repo_analyzer.prompts import (
     SUBSYSTEM_BATCH_SYSTEM_PROMPT,
     SUBSYSTEM_CLUSTER_SYSTEM_PROMPT,
     SUBSYSTEM_MERGE_SYSTEM_PROMPT,
 )
+from repo_analyzer.utils.async_openai import OpenAIRequest, run_batch, stream_batch
 
 logger = logging.getLogger(__name__)
 
@@ -380,12 +379,14 @@ def _phase1_initial_batching_from_snapshots(
     system_prompt = SUBSYSTEM_BATCH_SYSTEM_PROMPT.format(
         max_batches=SUBSYSTEM_MAX_INITIAL_BATCHES,
     )
-    response_text = _openai_response(
-        model=model,
+    results = run_batch([OpenAIRequest(
         system_prompt=system_prompt,
         user_prompt=prompt,
-    )
-    batches = _parse_phase1_response(response_text, valid_file_ids=valid_file_ids)
+        model=model,
+    )], max_concurrency=1)
+    if isinstance(results[0], Exception):
+        raise results[0]
+    batches = _parse_phase1_response(results[0], valid_file_ids=valid_file_ids)
 
     if not batches:
         logger.warning("Phase 1 returned 0 batches; falling back to single batch")
@@ -434,21 +435,6 @@ def _build_phase2_prompt(snapshots: list[FileMetadataSnapshot]) -> str:
     return "\n".join(lines)
 
 
-def _cluster_single_batch(
-    snapshots: list[FileMetadataSnapshot],
-    *,
-    model: str,
-) -> list[SubsystemSpec]:
-    """Call LLM with full metadata for one batch, return SubsystemSpecs."""
-    prompt = _build_phase2_prompt(snapshots)
-    response_text = _openai_response(
-        model=model,
-        system_prompt=SUBSYSTEM_CLUSTER_SYSTEM_PROMPT,
-        user_prompt=prompt,
-    )
-    return [_normalize_spec(s) for s in _parse_json_list(response_text)]
-
-
 def _phase2_cluster_batches(
     batches: list[FileBatch],
     snapshot_lookup: dict[int, FileMetadataSnapshot],
@@ -458,7 +444,7 @@ def _phase2_cluster_batches(
     task_id: int,
     total_batches: int,
 ) -> list[SubsystemSpec]:
-    """Run Phase 2 concurrently across batches.
+    """Run Phase 2 concurrently across batches using async OpenAI calls.
 
     Writes each subsystem to DB as results arrive and updates task progress.
     """
@@ -466,56 +452,67 @@ def _phase2_cluster_batches(
     all_specs: list[SubsystemSpec] = []
     batches_done = 0
 
-    def _process_batch(batch: FileBatch) -> list[SubsystemSpec]:
-        snapshots = [
+    # Build all OpenAI requests up front.
+    openai_requests: list[OpenAIRequest] = []
+    for batch in batches:
+        batch_snapshots = [
             snapshot_lookup[fid]
             for fid in batch["file_ids"]
             if fid in snapshot_lookup
         ]
-        if not snapshots:
-            return []
-        return _cluster_single_batch(snapshots, model=model)
+        prompt = _build_phase2_prompt(batch_snapshots) if batch_snapshots else ""
+        openai_requests.append(OpenAIRequest(
+            system_prompt=SUBSYSTEM_CLUSTER_SYSTEM_PROMPT,
+            user_prompt=prompt,
+            model=model,
+        ))
 
-    with ThreadPoolExecutor(max_workers=BUILD_SUBSYSTEM_MAX_CONCURRENCY) as executor:
-        future_to_batch = {
-            executor.submit(_process_batch, batch): batch
-            for batch in batches
-        }
-        for future in as_completed(future_to_batch):
-            batch = future_to_batch[future]
-            specs = future.result()  # re-raises on exception
-            all_specs.extend(specs)
-            batches_done += 1
+    # Stream results — write to DB as each completes.
+    for idx, result in stream_batch(openai_requests, max_concurrency=BUILD_SUBSYSTEM_MAX_CONCURRENCY):
+        batch = batches[idx]
+        batches_done += 1
 
-            # Write specs to DB and update progress.
-            with adapter.session() as write_session:
-                sub_mgr = SubsystemManager(write_session)
-                for spec in specs:
-                    sub_mgr.add_subsystem(
-                        repo_hash=repo_hash,
-                        name=spec["name"],
-                        description=spec["description"],
-                        file_ids=spec["file_ids"],
-                        keywords=spec["keywords"],
-                    )
-                db_task = write_session.query(IndexTask).filter(
-                    IndexTask.task_id == task_id,
-                ).one()
-                db_task.completed_files += len(batch["file_ids"])
-                db_task.updated_at = int(time.time())
-                db_task.set_progress(TaskProgress(
-                    phase=f"Clustering files — batch {batches_done}/{total_batches}",
-                    steps_done=batches_done,
-                    steps_total=total_batches,
-                ))
-                write_session.commit()
+        if isinstance(result, Exception):
+            logger.error("Phase 2 batch %d failed: %s", batch["batch_id"], result)
+            continue
 
-            logger.info(
-                "Phase 2 batch done batch_id=%d specs=%d repo_hash=%s",
-                batch["batch_id"],
-                len(specs),
-                repo_hash,
-            )
+        try:
+            specs = [_normalize_spec(s) for s in _parse_json_list(result)]
+        except Exception as exc:
+            logger.exception("Phase 2 parse failed batch_id=%d: %s", batch["batch_id"], exc)
+            continue
+
+        all_specs.extend(specs)
+
+        # Write specs to DB and update progress.
+        with adapter.session() as write_session:
+            sub_mgr = SubsystemManager(write_session)
+            for spec in specs:
+                sub_mgr.add_subsystem(
+                    repo_hash=repo_hash,
+                    name=spec["name"],
+                    description=spec["description"],
+                    file_ids=spec["file_ids"],
+                    keywords=spec["keywords"],
+                )
+            db_task = write_session.query(IndexTask).filter(
+                IndexTask.task_id == task_id,
+            ).one()
+            db_task.completed_files += len(batch["file_ids"])
+            db_task.updated_at = int(time.time())
+            db_task.set_progress(TaskProgress(
+                phase=f"Clustering files — batch {batches_done}/{total_batches}",
+                steps_done=batches_done,
+                steps_total=total_batches,
+            ))
+            write_session.commit()
+
+        logger.info(
+            "Phase 2 batch done batch_id=%d specs=%d repo_hash=%s",
+            batch["batch_id"],
+            len(specs),
+            repo_hash,
+        )
 
     return all_specs
 
@@ -567,12 +564,14 @@ def _merge_single_round(
     system_prompt = SUBSYSTEM_MERGE_SYSTEM_PROMPT.format(
         max_final=SUBSYSTEM_MAX_FINAL_COUNT,
     )
-    response_text = _openai_response(
-        model=model,
+    results = run_batch([OpenAIRequest(
         system_prompt=system_prompt,
         user_prompt=prompt,
-    )
-    return _parse_merge_response(response_text)
+        model=model,
+    )], max_concurrency=1)
+    if isinstance(results[0], Exception):
+        raise results[0]
+    return _parse_merge_response(results[0])
 
 
 def _specs_are_stable(
@@ -711,41 +710,6 @@ def _task_status(task: IndexTask) -> SubsystemStatus:
     )
 
 
-def _build_user_prompt(files: list[RepoFile]) -> str:
-    """Legacy prompt builder (kept for backward compatibility)."""
-    lines: list[str] = []
-    lines.append("Input files with metadata. Build subsystems from these files.")
-    lines.append("Return only JSON.")
-    for file in files:
-        meta = file.get_metadata() or {}
-        entry_point = bool(meta.get("entry_point") or False)
-        key_elements = meta.get("key_elements") or []
-        dependent_files = meta.get("dependent_files") or []
-        lines.append("")
-        lines.append(f"FILE_ID: {file.file_id}")
-        lines.append(f"PATH: {file.full_rel_path()}")
-        lines.append(f"RESPONSIBILITY: {meta.get('responsibility', '')}")
-        lines.append(f"KEY_ELEMENTS: {json.dumps(key_elements)}")
-        lines.append(f"DEPENDENT_FILES: {json.dumps(dependent_files)}")
-        lines.append(f"ENTRY_POINT: {str(entry_point).lower()}")
-    return "\n".join(lines)
-
-
-def _openai_response(*, model: str, system_prompt: str, user_prompt: str) -> str:
-    client = _get_openai_client()
-    response = client.responses.create(
-        model=model,
-        instructions=system_prompt,
-        input=user_prompt,
-    )
-    output_text = getattr(response, "output_text", None)
-    if isinstance(output_text, str):
-        return output_text
-    raise ValueError("Unexpected OpenAI response format.")
-
-
-def _get_openai_client() -> OpenAI:
-    return OpenAI()
 
 
 def _parse_json_list(text: str) -> list[dict[str, object]]:

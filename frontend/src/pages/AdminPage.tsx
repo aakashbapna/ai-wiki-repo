@@ -4,7 +4,6 @@ import {
   fetchSubsystemStatus,
   fetchWikiSidebars,
   fetchWikiStatus,
-  clearAllData,
   fetchSubsystems,
   fetchRepos,
   IndexStatus,
@@ -28,7 +27,6 @@ export default function AdminPage(): JSX.Element {
   const [wikiLoading, setWikiLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
-  const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<"index" | "subsystems" | "wiki">(
     "index",
   );
@@ -99,11 +97,9 @@ export default function AdminPage(): JSX.Element {
     if (!selectedRepo) {
       return;
     }
-    setActionMessage(null);
     try {
       const data = await triggerIndex(selectedRepo);
       setStatus(data);
-      setActionMessage("Indexing started.");
       const pollStatus = async (): Promise<IndexStatus> => {
         while (true) {
           const current = await fetchIndexStatus(selectedRepo);
@@ -126,11 +122,9 @@ export default function AdminPage(): JSX.Element {
     if (!selectedRepo) {
       return;
     }
-    setActionMessage(null);
     try {
       const data = await triggerSubsystemBuild(selectedRepo);
       setSubsystemStatus(data);
-      setActionMessage("Subsystem build started.");
       const pollStatus = async (): Promise<IndexStatus> => {
         while (true) {
           const current = await fetchSubsystemStatus(selectedRepo);
@@ -156,11 +150,9 @@ export default function AdminPage(): JSX.Element {
     if (!selectedRepo) {
       return;
     }
-    setActionMessage(null);
     try {
       const data = await triggerWikiBuild(selectedRepo);
       setWikiStatus(data);
-      setActionMessage("Wiki build started.");
       const pollStatus = async (): Promise<IndexStatus> => {
         while (true) {
           const current = await fetchWikiStatus(selectedRepo);
@@ -178,24 +170,6 @@ export default function AdminPage(): JSX.Element {
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "Failed to build wiki.";
-      setError(message);
-    }
-  };
-
-  const handleClearAll = async (): Promise<void> => {
-    if (!confirm("This will delete all repos and files. Continue?")) {
-      return;
-    }
-    setActionMessage(null);
-    try {
-      await clearAllData();
-      setRepos([]);
-      setSelectedRepo("");
-      setStatus(null);
-      setActionMessage("All data cleared.");
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Failed to clear data.";
       setError(message);
     }
   };
@@ -287,27 +261,18 @@ export default function AdminPage(): JSX.Element {
               </div>
               {status ? (
                 <div className="mt-3 grid gap-1 text-xs">
-                  <div>Status: {status.status}</div>
-                  <div>
-                    Completed: {status.completed_files} / {status.total_files}
-                  </div>
-                  <div>Remaining: {status.remaining_files}</div>
                   {status.progress?.phase && (
                     <div className="mt-1 text-accentDark font-medium">
                       {status.progress.phase}
-                      {status.progress.steps_total && status.progress.steps_total > 0
+                      {status.progress.steps_total &&
+                      status.progress.steps_total > 0
                         ? ` (${status.progress.steps_done ?? 0}/${status.progress.steps_total})`
                         : ""}
                     </div>
                   )}
                 </div>
               ) : (
-                <p className="mt-3 text-xs text-ink/60">
-                  No status available.
-                </p>
-              )}
-              {actionMessage && (
-                <p className="mt-2 text-xs text-accentDark">{actionMessage}</p>
+                <p className="mt-3 text-xs text-ink/60">No status available.</p>
               )}
             </div>
             <button
@@ -327,7 +292,9 @@ export default function AdminPage(): JSX.Element {
                 <span className="font-semibold">Subsystem Generation</span>
                 <button
                   type="button"
-                  onClick={() => selectedRepo && refreshSubsystems(selectedRepo)}
+                  onClick={() =>
+                    selectedRepo && refreshSubsystems(selectedRepo)
+                  }
                   className="text-xs text-accentDark"
                 >
                   Refresh
@@ -338,29 +305,25 @@ export default function AdminPage(): JSX.Element {
               </p>
               {subsystemStatus && (
                 <div className="mt-3 grid gap-1 text-xs">
-                  <div>Status: {subsystemStatus.status}</div>
-                  <div>
-                    Completed: {subsystemStatus.completed_files} / {subsystemStatus.total_files}
-                  </div>
                   {subsystemStatus.progress?.phase && (
                     <div className="mt-1 text-accentDark font-medium">
                       {subsystemStatus.progress.phase}
-                      {subsystemStatus.progress.steps_total && subsystemStatus.progress.steps_total > 0
+                      {subsystemStatus.progress.steps_total &&
+                      subsystemStatus.progress.steps_total > 0
                         ? ` (${subsystemStatus.progress.steps_done ?? 0}/${subsystemStatus.progress.steps_total})`
                         : ""}
                     </div>
                   )}
                 </div>
               )}
-              {actionMessage && (
-                <p className="mt-2 text-xs text-accentDark">{actionMessage}</p>
-              )}
               <div className="mt-4">
                 {subsystemsLoading && (
                   <p className="text-xs text-ink/60">Loading subsystems…</p>
                 )}
                 {!subsystemsLoading && subsystems.length === 0 && (
-                  <p className="text-xs text-ink/60">No subsystems available.</p>
+                  <p className="text-xs text-ink/60">
+                    No subsystems available.
+                  </p>
                 )}
                 {!subsystemsLoading && subsystems.length > 0 && (
                   <div className="space-y-2 text-xs text-ink/70">
@@ -371,7 +334,7 @@ export default function AdminPage(): JSX.Element {
                       >
                         <div className="flex items-center justify-between text-ink">
                           <span className="font-semibold">
-                          {subsystem.name}
+                            {subsystem.name}
                           </span>
                           <span className="text-[10px] text-ink/50">
                             #{subsystem.subsystem_id}
@@ -381,7 +344,10 @@ export default function AdminPage(): JSX.Element {
                           {subsystem.description || "No description available."}
                         </p>
                         <div className="mt-2 text-[10px] text-ink/50">
-                          Created {new Date(subsystem.created_at * 1000).toLocaleString()}
+                          Created{" "}
+                          {new Date(
+                            subsystem.created_at * 1000,
+                          ).toLocaleString()}
                         </div>
                       </div>
                     ))}
@@ -406,7 +372,9 @@ export default function AdminPage(): JSX.Element {
                 <span className="font-semibold">Wiki Generation</span>
                 <button
                   type="button"
-                  onClick={() => selectedRepo && refreshWikiSidebars(selectedRepo)}
+                  onClick={() =>
+                    selectedRepo && refreshWikiSidebars(selectedRepo)
+                  }
                   className="text-xs text-accentDark"
                 >
                   Refresh
@@ -417,15 +385,11 @@ export default function AdminPage(): JSX.Element {
               </p>
               {wikiStatus ? (
                 <div className="mt-3 grid gap-1 text-xs">
-                  <div>Status: {wikiStatus.status}</div>
-                  <div>
-                    Completed: {wikiStatus.completed_files} / {wikiStatus.total_files}
-                  </div>
-                  <div>Remaining: {wikiStatus.remaining_files}</div>
                   {wikiStatus.progress?.phase && (
                     <div className="mt-1 text-accentDark font-medium">
                       {wikiStatus.progress.phase}
-                      {wikiStatus.progress.steps_total && wikiStatus.progress.steps_total > 0
+                      {wikiStatus.progress.steps_total &&
+                      wikiStatus.progress.steps_total > 0
                         ? ` (${wikiStatus.progress.steps_done ?? 0}/${wikiStatus.progress.steps_total})`
                         : ""}
                     </div>
@@ -433,9 +397,6 @@ export default function AdminPage(): JSX.Element {
                 </div>
               ) : (
                 <p className="mt-3 text-xs text-ink/60">No status available.</p>
-              )}
-              {actionMessage && (
-                <p className="mt-2 text-xs text-accentDark">{actionMessage}</p>
               )}
               <div className="mt-4">
                 {wikiLoading && (
@@ -461,7 +422,9 @@ export default function AdminPage(): JSX.Element {
                           </span>
                         </div>
                         <div className="mt-1 text-[10px] text-ink/50">
-                          {node.page_id ? `Page ${node.page_id}` : "No page linked"}
+                          {node.page_id
+                            ? `Page ${node.page_id}`
+                            : "No page linked"}
                         </div>
                       </div>
                     ))}
@@ -476,17 +439,16 @@ export default function AdminPage(): JSX.Element {
             >
               Build Wiki
             </button>
+            {selectedRepo && (
+              <a
+                href={`/wiki/${selectedRepo}`}
+                className="rounded-xl border border-ink/20 bg-white px-4 py-3 text-center text-sm font-semibold text-ink hover:bg-mist"
+              >
+                View Wiki
+              </a>
+            )}
           </div>
         )}
-        <div className="mt-4">
-          <button
-            type="button"
-            onClick={handleClearAll}
-            className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-700"
-          >
-            Clear All Data
-          </button>
-        </div>
       </div>
     </section>
   );

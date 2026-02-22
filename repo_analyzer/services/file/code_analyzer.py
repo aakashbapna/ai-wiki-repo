@@ -4,20 +4,19 @@ import json
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, TypedDict
 
-from openai import OpenAI
 from sqlalchemy.orm import Session
 
 from constants import INDEX_FILE_MAX_CONCURRENCY, STALE_TASK_TIMEOUT_SECONDS
 from repo_analyzer.db import get_default_adapter
 from repo_analyzer.prompts import INDEX_FILE_SYSTEM_PROMPT
 from repo_analyzer.db_managers import RepoManager
-from repo_analyzer.models import IndexTask, Repo, RepoFile, RepoFileMetadata
+from repo_analyzer.models import IndexTask, RepoFile, RepoFileMetadata
 from repo_analyzer.models.index_task import TaskProgress, TaskStatus, TaskType, is_task_stale
+from repo_analyzer.utils.async_openai import OpenAIRequest, run_batch, stream_batch
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +47,17 @@ class FileForIndex:
     content: str
     file_size_bytes: int
 
+
+@dataclass(frozen=True)
+class _BatchPayload:
+    """Pre-built payload for one batch — pure data, no ORM objects."""
+    file_ids: list[int]
+    payloads: list[FileForIndex]
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 
 def index_repo(repo_hash: str, *, batch_size: int = 3) -> IndexTaskStatus:
     """
@@ -82,7 +92,6 @@ def index_repo(repo_hash: str, *, batch_size: int = 3) -> IndexTaskStatus:
                 existing.status = TaskStatus.STALE.value
                 existing.updated_at = now
                 existing.last_error = "Marked stale due to missing heartbeat."
-                # session auto-commits on __exit__
             else:
                 logger.info(
                     "Index task already running repo_hash=%s completed=%d total=%d",
@@ -93,20 +102,12 @@ def index_repo(repo_hash: str, *, batch_size: int = 3) -> IndexTaskStatus:
                 return _task_status(existing)
 
         files = repo_manager.list_repo_files(repo_hash, filter_scan_excluded=True)
-        logger.info(
-            "Scannable files loaded repo_hash=%s count=%d",
-            repo_hash,
-            len(files),
-        )
+        logger.info("Scannable files loaded repo_hash=%s count=%d", repo_hash, len(files))
         created_at = int(time.time())
         files_to_index = _filter_files_to_index(files, task_created_at=created_at)
-        logger.info(
-            "Initial files_to_index repo_hash=%s count=%d",
-            repo_hash,
-            len(files_to_index),
-        )
+        logger.info("Initial files_to_index repo_hash=%s count=%d", repo_hash, len(files_to_index))
 
-        # Snapshot plain data (file IDs + paths) before session closes.
+        # Snapshot plain data before session closes.
         repo_hash_val = repo.repo_hash
         repo_clone_path = repo.clone_path_resolved
         file_ids_to_index = [f.file_id for f in files_to_index]
@@ -151,6 +152,8 @@ def index_repo(repo_hash: str, *, batch_size: int = 3) -> IndexTaskStatus:
         logger.info("Index task created repo_hash=%s task_id=%d", repo_hash, task_id)
 
     # ── Launch background thread ──────────────────────────────────────────────
+    # The background thread runs _run_indexing which uses async/await internally
+    # for concurrent OpenAI calls, but all DB writes are serial.
     def _background() -> None:
         build_failed = False
         build_error = ""
@@ -179,7 +182,6 @@ def index_repo(repo_hash: str, *, batch_size: int = 3) -> IndexTaskStatus:
                     steps_total=db_task.total_files,
                 ))
             db_task.updated_at = int(time.time())
-            # fin_session auto-commits on __exit__
 
         logger.info("Index task finished repo_hash=%s failed=%s", repo_hash, build_failed)
 
@@ -192,19 +194,28 @@ def index_repo(repo_hash: str, *, batch_size: int = 3) -> IndexTaskStatus:
     return initial_status
 
 
+# ---------------------------------------------------------------------------
+# Sync helper used by service.py for single-file re-index
+# ---------------------------------------------------------------------------
+
 def index_file(files: list[FileForIndex], *, model: str = "gpt-5-mini") -> list[FileSummary]:
-    """Send a batch of files to the model and return per-file summaries."""
+    """Send a batch of files to the model and return per-file summaries (sync)."""
     if not files:
         return []
 
     system_prompt = INDEX_FILE_SYSTEM_PROMPT
     logger.debug("Indexing %d files with model=%s", len(files), model)
     user_prompt = _build_user_prompt(files)
-    response_text = _openai_response(
-        model=model,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
+
+    results = run_batch(
+        [OpenAIRequest(system_prompt=system_prompt, user_prompt=user_prompt, model=model, reasoning_effort="low")],
+        max_concurrency=1,
     )
+    result = results[0]
+    if isinstance(result, Exception):
+        raise result
+    response_text = result
+
     parsed = _parse_json_list(response_text)
     if len(parsed) != len(files):
         logger.warning(
@@ -213,9 +224,123 @@ def index_file(files: list[FileForIndex], *, model: str = "gpt-5-mini") -> list[
             len(files),
             len(parsed),
         )
-    reconciled = _reconcile_summaries(parsed, files)
-    return reconciled
+    return _reconcile_summaries(parsed, files)
 
+
+# ---------------------------------------------------------------------------
+# Core indexing pipeline (runs inside background thread)
+# ---------------------------------------------------------------------------
+
+def _run_indexing(
+    *,
+    repo_hash: str,
+    repo_clone_path: Path,
+    task_id: int,
+    file_ids: list[int],
+    batch_size: int,
+) -> None:
+    """
+    Index files using async OpenAI calls for concurrency.
+
+    1. Build payloads for the whole run (serial DB + filesystem reads).
+    2. Fire ALL LLM requests via ``stream_batch`` — results stream back one
+       at a time as each async request completes.
+    3. Write each result to DB immediately upon receipt, keeping the task
+       heartbeat alive and progress visible in real time.
+    """
+    adapter = get_default_adapter()
+    total_files = len(file_ids)
+    concurrency = INDEX_FILE_MAX_CONCURRENCY
+
+    # ── 1. Build payloads eagerly (serial DB + filesystem reads) ─────────────
+    batch_payloads: list[_BatchPayload] = []
+    with adapter.session() as read_session:
+        files: list[RepoFile] = (
+            read_session.query(RepoFile)
+            .filter(RepoFile.file_id.in_(file_ids))
+            .all()
+        )
+        batches = list(_batch(files, batch_size))
+        for batch in batches:
+            payloads = _build_file_payloads(repo_clone_path, batch)
+            batch_file_ids = [f.file_id for f in batch]
+            batch_payloads.append(_BatchPayload(
+                file_ids=batch_file_ids,
+                payloads=payloads,
+            ))
+
+    logger.info(
+        "Indexing repo=%s total_batches=%d concurrency=%d",
+        repo_hash, len(batch_payloads), concurrency,
+    )
+
+    system_prompt = INDEX_FILE_SYSTEM_PROMPT
+
+    # ── 2. Build all OpenAI requests up front ────────────────────────────────
+    openai_requests = [
+        OpenAIRequest(
+            system_prompt=system_prompt,
+            user_prompt=_build_user_prompt(bp.payloads),
+            model="gpt-5-mini",
+            reasoning_effort="low",
+        )
+        for bp in batch_payloads
+    ]
+
+    # ── 3. Stream results — write to DB as each one completes ────────────────
+    for idx, result in stream_batch(openai_requests, max_concurrency=concurrency):
+        bp = batch_payloads[idx]
+
+        if isinstance(result, Exception):
+            logger.error(
+                "Batch failed repo_hash=%s batch_size=%d: %s",
+                repo_hash, len(bp.file_ids), result,
+            )
+            with adapter.session() as write_session:
+                db_task = write_session.query(IndexTask).filter(
+                    IndexTask.task_id == task_id
+                ).one()
+                db_task.updated_at = int(time.time())
+                db_task.last_error = str(result)
+            continue
+
+        # Parse LLM response text into summaries.
+        try:
+            parsed = _parse_json_list(result)
+            summaries = _reconcile_summaries(parsed, bp.payloads)
+        except Exception as exc:
+            logger.exception(
+                "Failed to parse LLM response for batch repo_hash=%s: %s",
+                repo_hash, exc,
+            )
+            continue
+
+        # Write this batch's results immediately.
+        with adapter.session() as write_session:
+            db_files: list[RepoFile] = (
+                write_session.query(RepoFile)
+                .filter(RepoFile.file_id.in_(bp.file_ids))
+                .all()
+            )
+            db_task = write_session.query(IndexTask).filter(
+                IndexTask.task_id == task_id
+            ).one()
+            _apply_summaries(write_session, db_task, db_files, summaries, repo_root=repo_clone_path)
+            db_task.updated_at = int(time.time())
+            db_task.set_progress(TaskProgress(
+                phase="Indexing files",
+                steps_done=db_task.completed_files,
+                steps_total=total_files,
+            ))
+            logger.info(
+                "Batch written repo_hash=%s completed=%d total=%d",
+                repo_hash, db_task.completed_files, db_task.total_files,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _get_running_task(session: Session, repo_hash: str) -> IndexTask | None:
     return (
@@ -276,96 +401,6 @@ def _filter_files_to_index(files: Iterable[RepoFile], *, task_created_at: int | 
         str(task_created_at),
     )
     return to_index
-
-
-def _run_indexing(
-    *,
-    repo_hash: str,
-    repo_clone_path: Path,
-    task_id: int,
-    file_ids: list[int],
-    batch_size: int,
-) -> None:
-    """
-    Submit all batches concurrently (up to INDEX_FILE_MAX_CONCURRENCY workers).
-    As each batch's LLM call completes, write the results to the DB immediately
-    using a dedicated session so progress is visible without waiting for the full run.
-    """
-    adapter = get_default_adapter()
-    total_files = len(file_ids)
-
-    # Reload RepoFile objects in the background thread's own session.
-    with adapter.session() as read_session:
-        files: list[RepoFile] = (
-            read_session.query(RepoFile)
-            .filter(RepoFile.file_id.in_(file_ids))
-            .all()
-        )
-        # Detach by reading into plain list; session closes after block.
-
-    batches = list(_batch(files, batch_size))
-    logger.debug(
-        "Indexing repo=%s path=%s total_batches=%d concurrency=%d",
-        repo_hash, repo_clone_path, len(batches), INDEX_FILE_MAX_CONCURRENCY,
-    )
-
-    def _process_batch(
-        batch: list[RepoFile],
-    ) -> tuple[list[int], list[FileSummary]]:
-        payloads = _build_file_payloads(repo_clone_path, batch)
-        summaries = index_file(payloads)
-        return ([f.file_id for f in batch], summaries)
-
-    with ThreadPoolExecutor(max_workers=INDEX_FILE_MAX_CONCURRENCY) as executor:
-        future_to_batch = {
-            executor.submit(_process_batch, batch): batch
-            for batch in batches
-        }
-        for future in as_completed(future_to_batch):
-            batch = future_to_batch[future]
-            logger.info(
-                "Batch complete repo_hash=%s batch_size=%d",
-                repo_hash, len(batch),
-            )
-            try:
-                file_ids_done, summaries = future.result()
-            except Exception as exc:
-                logger.exception(
-                    "Batch failed repo_hash=%s batch_size=%d",
-                    repo_hash,
-                    len(batch),
-                )
-                with adapter.session() as write_session:
-                    db_task = write_session.query(IndexTask).filter(
-                        IndexTask.task_id == task_id
-                    ).one()
-                    db_task.updated_at = int(time.time())
-                    db_task.last_error = str(exc)
-                    write_session.commit()
-                continue
-
-            # Write this batch's results in its own session so they land immediately.
-            with adapter.session() as write_session:
-                db_files: list[RepoFile] = (
-                    write_session.query(RepoFile)
-                    .filter(RepoFile.file_id.in_(file_ids_done))
-                    .all()
-                )
-                db_task = write_session.query(IndexTask).filter(
-                    IndexTask.task_id == task_id
-                ).one()
-                _apply_summaries(write_session, db_task, db_files, summaries, repo_root=repo_clone_path)
-                db_task.updated_at = int(time.time())
-                db_task.set_progress(TaskProgress(
-                    phase="Indexing files",
-                    steps_done=db_task.completed_files,
-                    steps_total=total_files,
-                ))
-                write_session.commit()
-                logger.info(
-                    "Batch written repo_hash=%s completed=%d total=%d",
-                    repo_hash, db_task.completed_files, db_task.total_files,
-                )
 
 
 def _build_file_payloads(repo_root: Path, files: list[RepoFile]) -> list[FileForIndex]:
@@ -463,23 +498,6 @@ def _build_user_prompt(files: list[FileForIndex]) -> str:
         lines.append(file.content)
         lines.append(f"END FILE {idx}")
     return "\n".join(lines)
-
-
-def _openai_response(*, model: str, system_prompt: str, user_prompt: str) -> str:
-    client = _get_openai_client()
-    response = client.responses.create(
-        model=model,
-        instructions=system_prompt,
-        input=user_prompt,
-    )
-    output_text = getattr(response, "output_text", None)
-    if isinstance(output_text, str):
-        return output_text
-    raise ValueError("Unexpected OpenAI response format.")
-
-
-def _get_openai_client() -> OpenAI:
-    return OpenAI()
 
 
 def _parse_json_list(text: str) -> list[dict[str, object]]:

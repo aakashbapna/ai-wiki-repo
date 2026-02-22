@@ -1,4 +1,2 @@
 - Increase font weight of node item in sidebar
-- when item is click in sidebar scroll to content on mobile
 - give back to top button on mobile
-- remove data from repos on front page

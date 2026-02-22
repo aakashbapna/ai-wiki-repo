@@ -5,12 +5,10 @@ import logging
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict
 
-from openai import OpenAI
 from sqlalchemy.orm import Session
 
 from constants import (
@@ -21,9 +19,10 @@ from constants import (
 )
 from repo_analyzer.db import get_default_adapter
 from repo_analyzer.db_managers import RepoManager, WikiManager
-from repo_analyzer.models import IndexTask, Repo, RepoFile, RepoSubsystem
+from repo_analyzer.models import IndexTask, RepoFile, RepoSubsystem
 from repo_analyzer.models.index_task import TaskProgress, TaskStatus, TaskType, is_task_stale
 from repo_analyzer.prompts import WIKI_BUILDER_SYSTEM_PROMPT, WIKI_SIDEBAR_SYSTEM_PROMPT
+from repo_analyzer.utils.async_openai import OpenAIRequest, run_batch, stream_batch
 
 logger = logging.getLogger(__name__)
 
@@ -228,38 +227,61 @@ def _rebuild_wiki(
     model: str,
 ) -> None:
     """
-    Phase 1: Generate one wiki page per subsystem concurrently.
-             Each worker uses its own short-lived DB session that commits and
-             closes immediately — no outer session is held open.
+    Phase 1: Generate one wiki page per subsystem concurrently via
+             ``stream_batch``. DB reads + prompt building happen eagerly,
+             LLM calls run async, DB writes happen as each result arrives.
     Phase 2: Single LLM call to organize pages into a sidebar tree.
     """
     adapter = get_default_adapter()
 
-    def _process_subsystem(snap: SubsystemSnapshot) -> PageSummary | None:
-        """Generate and persist one wiki page inside its own DB session.
+    # Filter out empty subsystems.
+    active_snapshots = [s for s in snapshots if s.file_ids]
 
-        Returns PageSummary for sidebar generation, or None for empty subsystems.
-        """
-        if not snap.file_ids:
-            return None
-
-        # ── LLM call (no DB session held) ─────────────────────────────────────
+    # ── 1a. Build all user prompts eagerly (serial DB + filesystem reads) ────
+    user_prompts: list[str] = []
+    for snap in active_snapshots:
         with adapter.session() as read_session:
             db_files: list[RepoFile] = (
                 read_session.query(RepoFile)
                 .filter(RepoFile.repo_hash == repo_hash, RepoFile.file_id.in_(snap.file_ids))
                 .all()
             )
-
-        page_spec = _generate_page_from_snapshot(
+        user_prompts.append(_build_page_user_prompt(
             repo_full_name=repo_full_name,
             repo_clone_path=repo_clone_path,
             snap=snap,
             files=db_files,
-            model=model,
-        )
+        ))
 
-        # ── Write page + contents (own session, commits immediately) ───────────
+    # ── 1b. Fire all LLM requests via stream_batch ──────────────────────────
+    openai_requests = [
+        OpenAIRequest(
+            system_prompt=WIKI_BUILDER_SYSTEM_PROMPT,
+            user_prompt=prompt,
+            model=model,
+            api="chat",
+            response_format={"type": "json_object"},
+        )
+        for prompt in user_prompts
+    ]
+
+    page_summaries: list[PageSummary] = []
+
+    for idx, result in stream_batch(openai_requests, max_concurrency=BUILD_WIKI_MAX_CONCURRENCY):
+        snap = active_snapshots[idx]
+
+        if isinstance(result, Exception):
+            logger.error("Wiki page LLM failed subsystem=%r: %s", snap.name, result)
+            continue
+
+        try:
+            parsed = _parse_json_object(result)
+            page_spec = _normalize_page_spec(parsed)
+        except Exception as exc:
+            logger.exception("Wiki page parse failed subsystem=%r: %s", snap.name, exc)
+            continue
+
+        # Write page + contents.
         with adapter.session() as write_session:
             wiki_manager = WikiManager(write_session)
             page = wiki_manager.add_page(
@@ -277,11 +299,9 @@ def _rebuild_wiki(
                     content=node["content"],
                     source_file_ids=node["source_file_ids"],
                 )
-
             page_id = page.page_id
-            # session auto-commits on __exit__
 
-        # ── Update task progress (own session, commits immediately) ────────────
+        # Update task progress.
         with adapter.session() as task_session:
             db_task = task_session.query(IndexTask).filter(
                 IndexTask.task_id == task_id
@@ -293,45 +313,25 @@ def _rebuild_wiki(
                 steps_done=db_task.completed_files,
                 steps_total=db_task.total_files,
             ))
-            # session auto-commits on __exit__
 
         logger.info("Wiki page saved subsystem=%r page_id=%d repo_hash=%s",
-                    snap.name, page_id, repo_hash)
+                     snap.name, page_id, repo_hash)
 
         meta = json.loads(snap.meta_json) if snap.meta_json else {}
         keywords_raw = meta.get("keywords", [])
         keywords = keywords_raw if isinstance(keywords_raw, list) else []
 
-        return PageSummary(
+        page_summaries.append(PageSummary(
             page_id=page_id,
             title=page_spec["title"],
             subsystem_id=snap.subsystem_id,
             subsystem_name=snap.name,
             subsystem_description=snap.description,
             keywords=[str(k) for k in keywords],
-        )
+        ))
 
-    # Phase 1: Generate wiki pages concurrently
-    page_summaries: list[PageSummary] = []
-    with ThreadPoolExecutor(max_workers=BUILD_WIKI_MAX_CONCURRENCY) as executor:
-        futures = {executor.submit(_process_subsystem, snap): snap for snap in snapshots}
-        for future in as_completed(futures):
-            snap = futures[future]
-            try:
-                result = future.result()
-                if result is not None:
-                    page_summaries.append(result)
-            except Exception as exc:
-                logger.exception(
-                    "Wiki page generation failed for subsystem=%r repo_hash=%s: %s",
-                    snap.name,
-                    repo_hash,
-                    exc,
-                )
-
-    # Phase 2: Generate sidebar tree via single LLM call
+    # ── Phase 2: Generate sidebar tree via single LLM call ───────────────────
     if page_summaries:
-        # Update progress to reflect sidebar generation phase.
         try:
             with adapter.session() as prog_session:
                 db_task = prog_session.query(IndexTask).filter(
@@ -343,7 +343,6 @@ def _rebuild_wiki(
                     steps_total=db_task.total_files,
                 ))
                 db_task.updated_at = int(time.time())
-                # auto-commits on __exit__
         except Exception:
             logger.debug("Could not update progress before sidebar generation", exc_info=True)
 
@@ -615,11 +614,16 @@ def _generate_and_save_sidebar_tree(
         max_children=WIKI_SIDEBAR_MAX_CHILDREN,
     )
 
-    parsed = _openai_json_object_response(
-        model=model,
+    results = run_batch([OpenAIRequest(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
-    )
+        model=model,
+        api="chat",
+        response_format={"type": "json_object"},
+    )], max_concurrency=1)
+    if isinstance(results[0], Exception):
+        raise results[0]
+    parsed = _parse_json_object(results[0])
 
     try:
         tree = _parse_sidebar_tree(
@@ -657,15 +661,14 @@ def _generate_and_save_sidebar_tree(
 # Page generation helpers
 # ---------------------------------------------------------------------------
 
-def _generate_page_from_snapshot(
+def _build_page_user_prompt(
     *,
     repo_full_name: str,
     repo_clone_path: Path,
     snap: "SubsystemSnapshot",  # type: ignore[name-defined]
     files: list[RepoFile],
-    model: str,
-) -> WikiPageSpec:
-    """Build a wiki page spec using plain snapshot data (safe for threaded use)."""
+) -> str:
+    """Build the user prompt for a wiki page — pure data, no LLM call."""
     lines: list[str] = []
     lines.append("Context:")
     lines.append(f"REPO: {repo_full_name}")
@@ -684,98 +687,6 @@ def _generate_page_from_snapshot(
         file_path = repo_clone_path / Path(file.full_rel_path())
         meta = file.get_metadata() or {}
         file_summary = str(meta.get("file_summary") or "").strip()
-        content = ""
-        if file_summary and (file.file_size or 0) > 10_240:
-            content = ""
-        else:
-            content = _read_file_text(file_path)
-        lines.append(f"FILE_ID: {file.file_id}")
-        lines.append(f"FILE_PATH: {file.full_rel_path()}")
-        lines.append(f"FILE_SIZE_BYTES: {file.file_size}")
-        if file_summary and (file.file_size or 0) > 10_240:
-            lines.append("FILE_SUMMARY:")
-            lines.append(file_summary)
-        else:
-            lines.append("FILE_CONTENT:")
-            lines.append(content)
-        lines.append("END_FILE")
-        lines.append("")
-    user_prompt = "\n".join(lines)
-    parsed = _openai_json_object_response(
-        model=model,
-        system_prompt=WIKI_BUILDER_SYSTEM_PROMPT,
-        user_prompt=user_prompt,
-    )
-    return _normalize_page_spec(parsed)
-
-
-def _fetch_files_for_subsystem(
-    session: Session,
-    repo_hash: str,
-    file_ids: list[int],
-) -> list[RepoFile]:
-    return (
-        session.query(RepoFile)
-        .filter(RepoFile.repo_hash == repo_hash, RepoFile.file_id.in_(file_ids))
-        .all()
-    )
-
-
-def _create_sidebar_only(
-    wiki_manager: WikiManager,
-    repo_hash: str,
-    subsystem: RepoSubsystem,
-    *,
-    is_active: bool,
-    page_id: int | None = None,
-) -> None:
-    wiki_manager.add_sidebar(
-        repo_hash=repo_hash,
-        parent_node_id=None,
-        name=subsystem.name,
-        page_id=page_id,
-        is_active=is_active,
-        sub_system_ids=[subsystem.subsystem_id],
-    )
-
-
-def _generate_page(
-    repo: Repo,
-    subsystem: RepoSubsystem,
-    files: list[RepoFile],
-    *,
-    model: str,
-) -> WikiPageSpec:
-    user_prompt = _build_user_prompt(repo, subsystem, files)
-    parsed = _openai_json_object_response(
-        model=model,
-        system_prompt=WIKI_BUILDER_SYSTEM_PROMPT,
-        user_prompt=user_prompt,
-    )
-    return _normalize_page_spec(parsed)
-
-
-def _build_user_prompt(repo: Repo, subsystem: RepoSubsystem, files: list[RepoFile]) -> str:
-    lines: list[str] = []
-    meta = subsystem.get_meta() or {}
-    lines.append("Context:")
-    lines.append(f"REPO: {repo.full_name}")
-    lines.append(f"GROUP_NAME: {subsystem.name}")
-    lines.append(f"GROUP_DESCRIPTION: {subsystem.description}")
-    lines.append(f"FILE_IDS: {json.dumps(meta.get('file_ids') or [])}")
-    lines.append("")
-    lines.append("Writing goals:")
-    lines.append("- Explain expected behavior and workflows, not file descriptions.")
-    lines.append("- Assume the reader wants to use the system and understand its architecture.")
-    lines.append("- Use markdown headings (##/###/####), bullets, and short paragraphs.")
-    lines.append("- Provide concrete steps or sequences when describing tasks.")
-    lines.append("")
-    lines.append("FILES:")
-    for file in files:
-        file_path = repo.clone_path_resolved / Path(file.full_rel_path())
-        meta = file.get_metadata() or {}
-        file_summary = str(meta.get("file_summary") or "").strip()
-        content = ""
         if file_summary and (file.file_size or 0) > 10_240:
             content = ""
         else:
@@ -794,6 +705,7 @@ def _build_user_prompt(repo: Repo, subsystem: RepoSubsystem, files: list[RepoFil
     return "\n".join(lines)
 
 
+
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
@@ -805,46 +717,6 @@ def _read_file_text(path: Path, *, max_bytes: int = 120_000) -> str:
     if len(data) > max_bytes:
         data = data[:max_bytes]
     return data.decode("utf-8", errors="replace")
-
-
-def _openai_response(*, model: str, system_prompt: str, user_prompt: str) -> str:
-    client = _get_openai_client()
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
-    content = response.choices[0].message.content
-    if isinstance(content, str):
-        return content
-    raise ValueError("Unexpected OpenAI response format.")
-
-
-def _openai_json_object_response(
-    *,
-    model: str,
-    system_prompt: str,
-    user_prompt: str,
-) -> dict[str, object]:
-    client = _get_openai_client()
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        response_format={"type": "json_object"},
-    )
-    content = response.choices[0].message.content
-    if not isinstance(content, str):
-        raise ValueError("Unexpected OpenAI response format.")
-    return _parse_json_object(content)
-
-
-def _get_openai_client() -> OpenAI:
-    return OpenAI()
 
 
 def _parse_json_object(text: str) -> dict[str, object]:

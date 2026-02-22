@@ -259,9 +259,6 @@ export default function HomePage(): JSX.Element {
                 </h2>
                 <p className="text-xs text-ink/60">{repo.repo_hash}</p>
               </div>
-              <span className="rounded-full bg-mist px-3 py-1 text-xs text-ink/60">
-                {new Date(repo.created_at * 1000).toLocaleDateString()}
-              </span>
             </div>
             <p className="mt-3 text-sm text-ink/70">{repo.url}</p>
             <div className="mt-6 flex items-center gap-3">

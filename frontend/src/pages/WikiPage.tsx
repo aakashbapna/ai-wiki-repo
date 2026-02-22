@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import { Link, useNavigate, useParams } from "react-router-dom";
@@ -95,6 +95,7 @@ function normalizeMarkdownHeadings(content: string): string {
 export default function WikiPage(): JSX.Element {
   const { repoHash, pageId } = useParams();
   const navigate = useNavigate();
+  const contentRef = useRef<HTMLElement | null>(null);
   const [sidebars, setSidebars] = useState<WikiSidebarNode[]>([]);
   const [pageData, setPageData] = useState<WikiPageWithContents | null>(null);
   const [repoDetail, setRepoDetail] = useState<RepoSummary | null>(null);
@@ -243,12 +244,20 @@ export default function WikiPage(): JSX.Element {
                 </div>
               );
             }
+            const handleSidebarClick = (): void => {
+              if (window.innerWidth < 1024) {
+                setTimeout(() => {
+                  contentRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+                }, 0);
+              }
+            };
             return (
               <Link
                 key={node.node_id}
                 to={`/wiki/${repoHash}/page/${node.page_id}`}
                 className={`${baseClass} hover:underline`}
                 style={style}
+                onClick={handleSidebarClick}
               >
                 {node.name}
               </Link>
@@ -260,7 +269,10 @@ export default function WikiPage(): JSX.Element {
         </div>
       </aside>
 
-      <section className="rounded-2xl border border-ink/10 bg-white p-8 shadow-panel">
+      <section
+        ref={contentRef}
+        className="rounded-2xl border border-ink/10 bg-white p-8 shadow-panel"
+      >
         {loading && <p className="text-ink/60">Loading wiki…</p>}
         {error && <p className="text-red-600">{error}</p>}
         {!loading && !error && pageData && (
