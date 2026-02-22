@@ -6,7 +6,7 @@ from typing import TypedDict
 from repo_analyzer.db import get_default_adapter
 from repo_analyzer.db_managers import RepoManager, SubsystemManager
 from repo_analyzer.models import IndexTask
-from repo_analyzer.models.index_task import TaskStatus, TaskType, is_task_stale
+from repo_analyzer.models.index_task import TaskProgress, TaskStatus, TaskType, is_task_stale
 from repo_analyzer.services.subsystem.subsystem_builder import create_subsystems
 from constants import STALE_TASK_TIMEOUT_SECONDS
 
@@ -26,6 +26,7 @@ class SubsystemTaskStatus(TypedDict):
     completed_files: int
     remaining_files: int
     task_id: int
+    progress: TaskProgress
 
 
 class SubsystemService:
@@ -86,4 +87,5 @@ class SubsystemService:
                 completed_files=task.completed_files,
                 remaining_files=remaining,
                 task_id=task.task_id,
+                progress=task.get_progress(),
             )

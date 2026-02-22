@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   fetchIndexStatus,
+  fetchSubsystemStatus,
   fetchWikiSidebars,
   fetchWikiStatus,
   clearAllData,
@@ -19,6 +20,7 @@ export default function AdminPage(): JSX.Element {
   const [repos, setRepos] = useState<RepoSummary[]>([]);
   const [selectedRepo, setSelectedRepo] = useState<string>("");
   const [status, setStatus] = useState<IndexStatus | null>(null);
+  const [subsystemStatus, setSubsystemStatus] = useState<IndexStatus | null>(null);
   const [subsystems, setSubsystems] = useState<SubsystemSummary[]>([]);
   const [subsystemsLoading, setSubsystemsLoading] = useState<boolean>(false);
   const [wikiStatus, setWikiStatus] = useState<IndexStatus | null>(null);
@@ -102,6 +104,17 @@ export default function AdminPage(): JSX.Element {
       const data = await triggerIndex(selectedRepo);
       setStatus(data);
       setActionMessage("Indexing started.");
+      const pollStatus = async (): Promise<IndexStatus> => {
+        while (true) {
+          const current = await fetchIndexStatus(selectedRepo);
+          setStatus(current);
+          if (["completed", "failed", "stale", "stopped"].includes(current.status)) {
+            return current;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+        }
+      };
+      await pollStatus();
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "Failed to start indexing.";
@@ -116,11 +129,12 @@ export default function AdminPage(): JSX.Element {
     setActionMessage(null);
     try {
       const data = await triggerSubsystemBuild(selectedRepo);
-      setStatus(data);
+      setSubsystemStatus(data);
       setActionMessage("Subsystem build started.");
       const pollStatus = async (): Promise<IndexStatus> => {
         while (true) {
-          const current = await fetchIndexStatus(selectedRepo);
+          const current = await fetchSubsystemStatus(selectedRepo);
+          setSubsystemStatus(current);
           if (["completed", "failed", "stale", "stopped"].includes(current.status)) {
             return current;
           }
@@ -150,6 +164,7 @@ export default function AdminPage(): JSX.Element {
       const pollStatus = async (): Promise<IndexStatus> => {
         while (true) {
           const current = await fetchWikiStatus(selectedRepo);
+          setWikiStatus(current);
           if (["completed", "failed", "stale", "stopped"].includes(current.status)) {
             return current;
           }
@@ -277,6 +292,14 @@ export default function AdminPage(): JSX.Element {
                     Completed: {status.completed_files} / {status.total_files}
                   </div>
                   <div>Remaining: {status.remaining_files}</div>
+                  {status.progress?.phase && (
+                    <div className="mt-1 text-accentDark font-medium">
+                      {status.progress.phase}
+                      {status.progress.steps_total && status.progress.steps_total > 0
+                        ? ` (${status.progress.steps_done ?? 0}/${status.progress.steps_total})`
+                        : ""}
+                    </div>
+                  )}
                 </div>
               ) : (
                 <p className="mt-3 text-xs text-ink/60">
@@ -313,6 +336,22 @@ export default function AdminPage(): JSX.Element {
               <p className="mt-2 text-xs text-ink/60">
                 Build subsystem groupings from indexed files.
               </p>
+              {subsystemStatus && (
+                <div className="mt-3 grid gap-1 text-xs">
+                  <div>Status: {subsystemStatus.status}</div>
+                  <div>
+                    Completed: {subsystemStatus.completed_files} / {subsystemStatus.total_files}
+                  </div>
+                  {subsystemStatus.progress?.phase && (
+                    <div className="mt-1 text-accentDark font-medium">
+                      {subsystemStatus.progress.phase}
+                      {subsystemStatus.progress.steps_total && subsystemStatus.progress.steps_total > 0
+                        ? ` (${subsystemStatus.progress.steps_done ?? 0}/${subsystemStatus.progress.steps_total})`
+                        : ""}
+                    </div>
+                  )}
+                </div>
+              )}
               {actionMessage && (
                 <p className="mt-2 text-xs text-accentDark">{actionMessage}</p>
               )}
@@ -383,6 +422,14 @@ export default function AdminPage(): JSX.Element {
                     Completed: {wikiStatus.completed_files} / {wikiStatus.total_files}
                   </div>
                   <div>Remaining: {wikiStatus.remaining_files}</div>
+                  {wikiStatus.progress?.phase && (
+                    <div className="mt-1 text-accentDark font-medium">
+                      {wikiStatus.progress.phase}
+                      {wikiStatus.progress.steps_total && wikiStatus.progress.steps_total > 0
+                        ? ` (${wikiStatus.progress.steps_done ?? 0}/${wikiStatus.progress.steps_total})`
+                        : ""}
+                    </div>
+                  )}
                 </div>
               ) : (
                 <p className="mt-3 text-xs text-ink/60">No status available.</p>

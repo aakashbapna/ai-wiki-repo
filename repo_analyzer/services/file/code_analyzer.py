@@ -2,6 +2,7 @@
 
 import json
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -16,9 +17,10 @@ from repo_analyzer.db import get_default_adapter
 from repo_analyzer.prompts import INDEX_FILE_SYSTEM_PROMPT
 from repo_analyzer.db_managers import RepoManager
 from repo_analyzer.models import IndexTask, Repo, RepoFile, RepoFileMetadata
-from repo_analyzer.models.index_task import TaskStatus, TaskType, is_task_stale
+from repo_analyzer.models.index_task import TaskProgress, TaskStatus, TaskType, is_task_stale
 
 logger = logging.getLogger(__name__)
+
 
 class IndexTaskStatus(TypedDict):
     repo_hash: str
@@ -27,6 +29,7 @@ class IndexTaskStatus(TypedDict):
     completed_files: int
     remaining_files: int
     task_id: int
+    progress: TaskProgress
 
 
 class FileSummary(TypedDict):
@@ -48,15 +51,18 @@ class FileForIndex:
 
 def index_repo(repo_hash: str, *, batch_size: int = 3) -> IndexTaskStatus:
     """
-    Index a repository's files and store metadata in RepoFile.
+    Start indexing a repository's files in a background thread.
 
-    Ensures only one running task per repo. If one exists, returns its status.
+    Returns immediately with initial task status. Ensures only one running task
+    per repo. If one exists, returns its current status.
     """
     if not repo_hash.strip():
         raise ValueError("repo_hash is required")
 
     logger.info("Starting index_repo for repo_hash=%s batch_size=%d", repo_hash, batch_size)
     adapter = get_default_adapter()
+
+    # ── Phase 0: read repo + guard against duplicate runs ────────────────────
     with adapter.session() as session:
         repo_manager = RepoManager(session)
         repo = repo_manager.get_by_hash(repo_hash)
@@ -76,7 +82,7 @@ def index_repo(repo_hash: str, *, batch_size: int = 3) -> IndexTaskStatus:
                 existing.status = TaskStatus.STALE.value
                 existing.updated_at = now
                 existing.last_error = "Marked stale due to missing heartbeat."
-                session.commit()
+                # session auto-commits on __exit__
             else:
                 logger.info(
                     "Index task already running repo_hash=%s completed=%d total=%d",
@@ -99,12 +105,15 @@ def index_repo(repo_hash: str, *, batch_size: int = 3) -> IndexTaskStatus:
             repo_hash,
             len(files_to_index),
         )
-        logger.info(
-            "Files to index repo_hash=%s total=%d",
-            repo_hash,
-            len(files_to_index),
-        )
-        if not files_to_index:
+
+        # Snapshot plain data (file IDs + paths) before session closes.
+        repo_hash_val = repo.repo_hash
+        repo_clone_path = repo.clone_path_resolved
+        file_ids_to_index = [f.file_id for f in files_to_index]
+
+    # ── No files to index: create completed task immediately ─────────────────
+    if not file_ids_to_index:
+        with adapter.session() as session:
             task = IndexTask(
                 repo_hash=repo_hash,
                 task_type=TaskType.INDEX_FILE.value,
@@ -119,51 +128,68 @@ def index_repo(repo_hash: str, *, batch_size: int = 3) -> IndexTaskStatus:
             logger.info("No files to index for repo_hash=%s", repo_hash)
             return _task_status(task)
 
+    # ── Create running task record ────────────────────────────────────────────
+    with adapter.session() as session:
         task = IndexTask(
             repo_hash=repo_hash,
             task_type=TaskType.INDEX_FILE.value,
             status=TaskStatus.RUNNING.value,
-            total_files=len(files_to_index),
+            total_files=len(file_ids_to_index),
             completed_files=0,
             created_at=created_at,
             updated_at=created_at,
         )
+        task.set_progress(TaskProgress(
+            phase="Starting",
+            steps_done=0,
+            steps_total=len(file_ids_to_index),
+        ))
         session.add(task)
         session.flush()
-        logger.info("Index task created repo_hash=%s task_id=%d", repo_hash, task.task_id)
+        task_id = task.task_id
+        initial_status = _task_status(task)
+        logger.info("Index task created repo_hash=%s task_id=%d", repo_hash, task_id)
 
+    # ── Launch background thread ──────────────────────────────────────────────
+    def _background() -> None:
+        build_failed = False
+        build_error = ""
         try:
-            files_to_index = _filter_files_to_index(files, task_created_at=task.created_at)
-            logger.info(
-                "Filtered files_to_index repo_hash=%s task_id=%d created_at=%d count=%d",
-                repo_hash,
-                task.task_id,
-                task.created_at,
-                len(files_to_index),
-            )
-            task.total_files = len(files_to_index)
-            session.commit()
-            _run_indexing(session, repo, task, files_to_index, batch_size=batch_size)
-            # Reload task to pick up completed_files written by worker sessions.
-            session.expire(task)
-            task.status = TaskStatus.COMPLETED.value
-            task.updated_at = int(time.time())
-            session.commit()
-            logger.info(
-                "Index task completed repo_hash=%s completed=%d total=%d",
-                repo_hash,
-                task.completed_files,
-                task.total_files,
+            _run_indexing(
+                repo_hash=repo_hash_val,
+                repo_clone_path=repo_clone_path,
+                task_id=task_id,
+                file_ids=file_ids_to_index,
+                batch_size=batch_size,
             )
         except Exception as exc:
-            task.status = TaskStatus.FAILED.value
-            task.updated_at = int(time.time())
-            task.last_error = str(exc)
-            session.commit()
+            build_failed = True
+            build_error = str(exc)
             logger.exception("Index task failed repo_hash=%s", repo_hash)
-            raise
 
-        return _task_status(task)
+        with adapter.session() as fin_session:
+            db_task = fin_session.query(IndexTask).filter(IndexTask.task_id == task_id).one()
+            db_task.status = TaskStatus.FAILED.value if build_failed else TaskStatus.COMPLETED.value
+            if build_failed:
+                db_task.last_error = build_error
+            else:
+                db_task.set_progress(TaskProgress(
+                    phase="Completed",
+                    steps_done=db_task.completed_files,
+                    steps_total=db_task.total_files,
+                ))
+            db_task.updated_at = int(time.time())
+            # fin_session auto-commits on __exit__
+
+        logger.info("Index task finished repo_hash=%s failed=%s", repo_hash, build_failed)
+
+    threading.Thread(
+        target=_background,
+        daemon=True,
+        name=f"index-{repo_hash[:8]}",
+    ).start()
+
+    return initial_status
 
 
 def index_file(files: list[FileForIndex], *, model: str = "gpt-5-mini") -> list[FileSummary]:
@@ -213,6 +239,7 @@ def _task_status(task: IndexTask) -> IndexTaskStatus:
         completed_files=task.completed_files,
         remaining_files=remaining,
         task_id=task.task_id,
+        progress=task.get_progress(),
     )
 
 
@@ -252,11 +279,11 @@ def _filter_files_to_index(files: Iterable[RepoFile], *, task_created_at: int | 
 
 
 def _run_indexing(
-    session: Session,
-    repo: Repo,
-    task: IndexTask,
-    files: list[RepoFile],
     *,
+    repo_hash: str,
+    repo_clone_path: Path,
+    task_id: int,
+    file_ids: list[int],
     batch_size: int,
 ) -> None:
     """
@@ -264,22 +291,28 @@ def _run_indexing(
     As each batch's LLM call completes, write the results to the DB immediately
     using a dedicated session so progress is visible without waiting for the full run.
     """
-    repo_root = repo.clone_path_resolved
-    task_id = task.task_id
-    repo_hash = task.repo_hash
     adapter = get_default_adapter()
+    total_files = len(file_ids)
+
+    # Reload RepoFile objects in the background thread's own session.
+    with adapter.session() as read_session:
+        files: list[RepoFile] = (
+            read_session.query(RepoFile)
+            .filter(RepoFile.file_id.in_(file_ids))
+            .all()
+        )
+        # Detach by reading into plain list; session closes after block.
+
     batches = list(_batch(files, batch_size))
     logger.debug(
         "Indexing repo=%s path=%s total_batches=%d concurrency=%d",
-        repo_hash, repo_root, len(batches), INDEX_FILE_MAX_CONCURRENCY,
+        repo_hash, repo_clone_path, len(batches), INDEX_FILE_MAX_CONCURRENCY,
     )
 
-    # Each worker receives pre-built payloads (pure data, no ORM objects).
-    # Returns (batch_file_ids, summaries) so we can match back to DB rows.
     def _process_batch(
         batch: list[RepoFile],
     ) -> tuple[list[int], list[FileSummary]]:
-        payloads = _build_file_payloads(repo_root, batch)
+        payloads = _build_file_payloads(repo_clone_path, batch)
         summaries = index_file(payloads)
         return ([f.file_id for f in batch], summaries)
 
@@ -295,7 +328,7 @@ def _run_indexing(
                 repo_hash, len(batch),
             )
             try:
-                file_ids, summaries = future.result()  # re-raises on exception
+                file_ids_done, summaries = future.result()
             except Exception as exc:
                 logger.exception(
                     "Batch failed repo_hash=%s batch_size=%d",
@@ -310,19 +343,24 @@ def _run_indexing(
                     db_task.last_error = str(exc)
                     write_session.commit()
                 continue
+
             # Write this batch's results in its own session so they land immediately.
             with adapter.session() as write_session:
-                # Reload the files from DB by ID to get a fresh ORM-bound objects.
                 db_files: list[RepoFile] = (
                     write_session.query(RepoFile)
-                    .filter(RepoFile.file_id.in_(file_ids))
+                    .filter(RepoFile.file_id.in_(file_ids_done))
                     .all()
                 )
                 db_task = write_session.query(IndexTask).filter(
                     IndexTask.task_id == task_id
                 ).one()
-                _apply_summaries(write_session, db_task, db_files, summaries, repo_root=repo_root)
+                _apply_summaries(write_session, db_task, db_files, summaries, repo_root=repo_clone_path)
                 db_task.updated_at = int(time.time())
+                db_task.set_progress(TaskProgress(
+                    phase="Indexing files",
+                    steps_done=db_task.completed_files,
+                    steps_total=total_files,
+                ))
                 write_session.commit()
                 logger.info(
                     "Batch written repo_hash=%s completed=%d total=%d",

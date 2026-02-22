@@ -26,6 +26,7 @@ _MIGRATIONS: list[tuple[str, str, str, str]] = [
     ("repo_files", "last_index_at", "INTEGER", "0"),
     ("repo_files", "file_size", "INTEGER", "0"),
     ("index_tasks", "task_type", "VARCHAR(32)", "'index_file'"),
+    ("index_tasks", "meta_json", "TEXT", "NULL"),
 ]
 
 
@@ -88,9 +89,15 @@ class SQLiteAdapter(DBAdapter):
                 cur.execute(f"PRAGMA table_info({table})")
                 existing = {row[1] for row in cur.fetchall()}
                 if column not in existing:
-                    cur.execute(
-                        f"ALTER TABLE {table} ADD COLUMN {column} {sql_type} NOT NULL DEFAULT {default}"
-                    )
+                    # Nullable columns (DEFAULT NULL) must not have NOT NULL constraint.
+                    if default.upper() == "NULL":
+                        cur.execute(
+                            f"ALTER TABLE {table} ADD COLUMN {column} {sql_type} DEFAULT {default}"
+                        )
+                    else:
+                        cur.execute(
+                            f"ALTER TABLE {table} ADD COLUMN {column} {sql_type} NOT NULL DEFAULT {default}"
+                        )
             conn.commit()
         finally:
             conn.close()

@@ -22,7 +22,7 @@ from constants import (
 from repo_analyzer.db import get_default_adapter
 from repo_analyzer.db_managers import RepoManager, WikiManager
 from repo_analyzer.models import IndexTask, Repo, RepoFile, RepoSubsystem
-from repo_analyzer.models.index_task import TaskStatus, TaskType, is_task_stale
+from repo_analyzer.models.index_task import TaskProgress, TaskStatus, TaskType, is_task_stale
 from repo_analyzer.prompts import WIKI_BUILDER_SYSTEM_PROMPT, WIKI_SIDEBAR_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,7 @@ class WikiTaskStatus(TypedDict):
     completed_files: int
     remaining_files: int
     task_id: int
+    progress: TaskProgress
 
 
 class WikiContentSpec(TypedDict):
@@ -157,6 +158,11 @@ def build_wiki(repo_hash: str, *, model: str = "gpt-5-mini") -> WikiTaskStatus:
             created_at=int(time.time()),
             updated_at=int(time.time()),
         )
+        task.set_progress(TaskProgress(
+            phase="Starting",
+            steps_done=0,
+            steps_total=len(snapshots),
+        ))
         session.add(task)
         session.flush()
         task_id = task.task_id
@@ -188,6 +194,12 @@ def build_wiki(repo_hash: str, *, model: str = "gpt-5-mini") -> WikiTaskStatus:
             db_task.status = TaskStatus.FAILED.value if build_failed else TaskStatus.COMPLETED.value
             if build_failed:
                 db_task.last_error = build_error
+            else:
+                db_task.set_progress(TaskProgress(
+                    phase="Completed",
+                    steps_done=db_task.completed_files,
+                    steps_total=db_task.total_files,
+                ))
             db_task.updated_at = int(time.time())
             # fin_session auto-commits on __exit__
 
@@ -276,6 +288,11 @@ def _rebuild_wiki(
             ).one()
             db_task.completed_files += len(snap.file_ids)
             db_task.updated_at = int(time.time())
+            db_task.set_progress(TaskProgress(
+                phase="Generating pages",
+                steps_done=db_task.completed_files,
+                steps_total=db_task.total_files,
+            ))
             # session auto-commits on __exit__
 
         logger.info("Wiki page saved subsystem=%r page_id=%d repo_hash=%s",
@@ -314,6 +331,22 @@ def _rebuild_wiki(
 
     # Phase 2: Generate sidebar tree via single LLM call
     if page_summaries:
+        # Update progress to reflect sidebar generation phase.
+        try:
+            with adapter.session() as prog_session:
+                db_task = prog_session.query(IndexTask).filter(
+                    IndexTask.task_id == task_id
+                ).one()
+                db_task.set_progress(TaskProgress(
+                    phase="Generating sidebar",
+                    steps_done=db_task.completed_files,
+                    steps_total=db_task.total_files,
+                ))
+                db_task.updated_at = int(time.time())
+                # auto-commits on __exit__
+        except Exception:
+            logger.debug("Could not update progress before sidebar generation", exc_info=True)
+
         _generate_and_save_sidebar_tree(
             repo_hash=repo_hash,
             repo_full_name=repo_full_name,
@@ -934,4 +967,5 @@ def _task_status(task: IndexTask) -> WikiTaskStatus:
         completed_files=task.completed_files,
         remaining_files=remaining,
         task_id=task.task_id,
+        progress=task.get_progress(),
     )

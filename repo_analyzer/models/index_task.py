@@ -1,8 +1,10 @@
 """IndexTask model: tracks repository indexing progress."""
 
+import json
 import time
 
 from enum import Enum
+from typing import TypedDict
 
 from sqlalchemy import Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
@@ -22,6 +24,18 @@ class TaskStatus(str, Enum):
     FAILED = "failed"
     STOPPED = "stopped"
     STALE = "stale"
+
+
+class TaskProgress(TypedDict, total=False):
+    """Structured progress stored in IndexTask.meta_json.
+
+    phase       — human-readable label for the current step ("Indexing files")
+    steps_done  — discrete steps finished in the current phase
+    steps_total — total steps expected (0 = indeterminate / spinner only)
+    """
+    phase: str
+    steps_done: int
+    steps_total: int
 
 
 class IndexTask(Base):
@@ -47,6 +61,25 @@ class IndexTask(Base):
         Integer, nullable=False, default=lambda: int(time.time())
     )
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    meta_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    def get_progress(self) -> TaskProgress:
+        """Return structured progress metadata, or an empty TaskProgress."""
+        if not self.meta_json:
+            return TaskProgress()
+        try:
+            data = json.loads(self.meta_json)
+            if not isinstance(data, dict):
+                return TaskProgress()
+            return TaskProgress(
+                **{k: v for k, v in data.items() if k in ("phase", "steps_done", "steps_total")}
+            )
+        except (json.JSONDecodeError, TypeError):
+            return TaskProgress()
+
+    def set_progress(self, progress: TaskProgress) -> None:
+        """Serialise progress metadata into meta_json."""
+        self.meta_json = json.dumps(dict(progress))
 
     def __repr__(self) -> str:
         return (

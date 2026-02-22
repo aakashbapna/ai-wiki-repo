@@ -7,7 +7,7 @@ from constants import STALE_TASK_TIMEOUT_SECONDS
 from repo_analyzer.db import get_default_adapter
 from repo_analyzer.db_managers import RepoManager, WikiManager
 from repo_analyzer.models import IndexTask, RepoFile
-from repo_analyzer.models.index_task import TaskStatus, TaskType, is_task_stale
+from repo_analyzer.models.index_task import TaskProgress, TaskStatus, TaskType, is_task_stale
 from repo_analyzer.services.wiki.wiki_builder import build_wiki
 
 
@@ -18,6 +18,7 @@ class WikiTaskStatus(TypedDict):
     completed_files: int
     remaining_files: int
     task_id: int
+    progress: TaskProgress
 
 
 class WikiService:
@@ -56,6 +57,7 @@ class WikiService:
                 completed_files=task.completed_files,
                 remaining_files=remaining,
                 task_id=task.task_id,
+                progress=task.get_progress(),
             )
 
     @staticmethod

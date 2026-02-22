@@ -25,7 +25,7 @@ BUILD_SUBSYSTEM_MAX_CONCURRENCY: int = 5
 BUILD_WIKI_MAX_CONCURRENCY: int = 5
 
 # Task staleness timeout (seconds) for running tasks without recent updates.
-STALE_TASK_TIMEOUT_SECONDS: int = 30
+STALE_TASK_TIMEOUT_SECONDS: int = 60
 
 # ── Hierarchical subsystem clustering ─────────────────────────────────────────
 # Phase 1: max number of initial file batches the LLM can produce

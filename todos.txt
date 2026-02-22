@@ -1,1 +1,4 @@
-TODO: Implement RepoSubsystem + subsystem builder + task persistence + services/db_managers refactor + endpoints
+- Increase font weight of node item in sidebar
+- when item is click in sidebar scroll to content on mobile
+- give back to top button on mobile
+- remove data from repos on front page

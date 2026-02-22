@@ -10,7 +10,7 @@ from repo_analyzer.services.wiki.service import WikiService
 from repo_analyzer.db_managers import RepoManager
 from repo_analyzer.models import IndexTask, Repo, RepoFile, RepoFileMetadata
 from constants import STALE_TASK_TIMEOUT_SECONDS
-from repo_analyzer.models.index_task import TaskStatus, TaskType, is_task_stale
+from repo_analyzer.models.index_task import TaskProgress, TaskStatus, TaskType, is_task_stale
 
 
 class ListFilesResult(TypedDict):
@@ -132,6 +132,7 @@ class FileService:
                 completed_files=task.completed_files,
                 remaining_files=remaining,
                 task_id=task.task_id,
+                progress=task.get_progress(),
             )
 
     @staticmethod
@@ -197,11 +198,18 @@ def _index_repo_file(repo: Repo, repo_file: RepoFile) -> RepoFileMetadata:
     rel_path = Path(repo_file.full_rel_path())
     file_path = repo.clone_path_resolved / rel_path
     content = _read_file_text(file_path)
+    file_size_bytes = 0
+    if file_path.exists() and file_path.is_file():
+        try:
+            file_size_bytes = file_path.stat().st_size
+        except OSError:
+            file_size_bytes = 0
     summaries = index_file([
         FileForIndex(
             file_path=rel_path.as_posix(),
             file_name=repo_file.file_name,
             content=content,
+            file_size_bytes=file_size_bytes,
         )
     ])
     summary = summaries[0]

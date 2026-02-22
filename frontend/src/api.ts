@@ -70,6 +70,12 @@ export type SubsystemListResponse = {
   subsystems: SubsystemSummary[];
 };
 
+export type TaskProgress = {
+  phase?: string;
+  steps_done?: number;
+  steps_total?: number;
+};
+
 export type IndexStatus = {
   repo_hash: string;
   status: string;
@@ -77,6 +83,7 @@ export type IndexStatus = {
   completed_files: number;
   remaining_files: number;
   task_id: number;
+  progress: TaskProgress;
 };
 
 export type RepoFileContent = {

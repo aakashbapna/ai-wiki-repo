@@ -30,7 +30,12 @@ function formatProgress(status: IndexStatus | null): string {
   if (!status) {
     return "Not started";
   }
-  return `${status.status} • ${status.completed_files}/${status.total_files}`;
+  const phase = status.progress?.phase;
+  const base = `${status.status} • ${status.completed_files}/${status.total_files}`;
+  if (phase && status.status === "running") {
+    return `${base} — ${phase}`;
+  }
+  return base;
 }
 
 export default function HomePage(): JSX.Element {
