@@ -217,10 +217,10 @@ export default function WikiPage(): JSX.Element {
   return (
     <div className="grid gap-8 lg:grid-cols-[280px_1fr]">
       <aside className="rounded-2xl border border-ink/10 bg-white p-5 shadow-panel">
-        <h2 className="font-display text-lg font-semibold">
+        <h2 className="font-display text-lg font-semibold truncate" title={repoDetail ? `${repoDetail.owner ? `${repoDetail.owner}/` : ""}${repoDetail.repo_name}` : "Repository"}>
           {repoDetail ? `${repoDetail.owner ? `${repoDetail.owner}/` : ""}${repoDetail.repo_name}` : "Repository"}
         </h2>
-        <p className="text-xs text-ink/60">
+        <p className="text-xs text-ink/60 truncate" title={repoDetail?.url}>
           {repoDetail ? repoDetail.url : "Repository wiki"}
         </p>
         <div className="mt-4 space-y-2">
