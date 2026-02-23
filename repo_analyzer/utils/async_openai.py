@@ -187,8 +187,12 @@ def stream_batch(
     """
     if not requests:
         return
-
-    client = _get_async_client()
+    if not _is_openai_model(requests[0].model):
+        logger.info("Using LiteLLM for model=%s", requests[0].model)
+        client = None
+    else:
+        logger.info("Using OpenAI for model=%s", requests[0].model)
+        client = _get_async_client()
     loop = asyncio.new_event_loop()
 
     async def _run():

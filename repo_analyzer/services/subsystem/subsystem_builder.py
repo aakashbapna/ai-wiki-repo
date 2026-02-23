@@ -384,6 +384,7 @@ def _phase1_initial_batching_from_snapshots(
         system_prompt=system_prompt,
         user_prompt=prompt,
         model=model,
+        response_format={"type": "json_object"},
     )], max_concurrency=1)
     if isinstance(results[0], Exception):
         raise results[0]
@@ -466,6 +467,7 @@ def _phase2_cluster_batches(
             system_prompt=SUBSYSTEM_CLUSTER_SYSTEM_PROMPT,
             user_prompt=prompt,
             model=model,
+            response_format={"type": "json_object"},
         ))
 
     # Stream results — write to DB as each completes.
@@ -569,6 +571,7 @@ def _merge_single_round(
         system_prompt=system_prompt,
         user_prompt=prompt,
         model=model,
+        response_format={"type": "json_object"},
     )], max_concurrency=1)
     if isinstance(results[0], Exception):
         raise results[0]

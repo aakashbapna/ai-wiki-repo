@@ -208,7 +208,7 @@ def index_file(files: list[FileForIndex], *, model: str = LLM_MODEL) -> list[Fil
     user_prompt = _build_user_prompt(files)
 
     results = run_batch(
-        [OpenAIRequest(system_prompt=system_prompt, user_prompt=user_prompt, model=model, reasoning_effort="low")],
+        [OpenAIRequest(system_prompt=system_prompt, user_prompt=user_prompt, model=model, reasoning_effort="low", response_format={"type": "json_object"})],
         max_concurrency=1,
     )
     result = results[0]
@@ -270,18 +270,18 @@ def _run_indexing(
             ))
 
     logger.info(
-        "Indexing repo=%s total_batches=%d concurrency=%d",
-        repo_hash, len(batch_payloads), concurrency,
+        "Indexing repo=%s total_batches=%d concurrency=%d, model=%s",
+        repo_hash, len(batch_payloads), concurrency, LLM_MODEL,
     )
 
     system_prompt = INDEX_FILE_SYSTEM_PROMPT
-
     # ── 2. Build all OpenAI requests up front ────────────────────────────────
     openai_requests = [
         OpenAIRequest(
             system_prompt=system_prompt,
             user_prompt=_build_user_prompt(bp.payloads),
             model=LLM_MODEL,
+            response_format={"type": "json_object"},
             reasoning_effort="low" if _is_openai_model(LLM_MODEL) else None,
         )
         for bp in batch_payloads
