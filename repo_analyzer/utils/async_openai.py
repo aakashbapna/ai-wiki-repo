@@ -20,6 +20,7 @@ import logging
 from dataclasses import dataclass
 from typing import Generator, Literal
 
+import litellm
 from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,15 @@ _RETRY_TRANSIENT_DELAY = 2  # seconds
 # Transient error strings worth retrying on.
 _TRANSIENT_SIGNALS = ("connection error", "timed out", "rate limit", "502", "503", "529")
 
+# Model name prefixes that are routed directly through the OpenAI SDK.
+# Everything else (e.g. "gemini/...") is routed through LiteLLM.
+_OPENAI_MODEL_PREFIXES = ("gpt-", "o1", "o3", "o4", "chatgpt-")
+
+
+def _is_openai_model(model: str) -> bool:
+    """Return True when *model* should be called via the native OpenAI SDK."""
+    return model.startswith(_OPENAI_MODEL_PREFIXES)
+
 
 def _get_async_client() -> AsyncOpenAI:
     global _async_client
@@ -42,7 +52,13 @@ def _get_async_client() -> AsyncOpenAI:
 
 @dataclass(frozen=True)
 class OpenAIRequest:
-    """A single OpenAI request specification."""
+    """A single LLM request specification.
+
+    ``model`` may be any OpenAI model name (e.g. ``"gpt-5-mini"``) or a
+    LiteLLM-style model string for other providers (e.g. ``"gemini/gemini-2.0-flash"``).
+    Non-OpenAI models are automatically routed through LiteLLM and always use
+    the Chat Completions format regardless of the ``api`` field.
+    """
 
     system_prompt: str
     user_prompt: str
@@ -90,7 +106,33 @@ async def _call_chat_api(client: AsyncOpenAI, req: OpenAIRequest) -> str:
     raise ValueError("Unexpected OpenAI Chat API format.")
 
 
+async def _call_litellm_api(req: OpenAIRequest) -> str:
+    """Route the request through LiteLLM (used for non-OpenAI models, e.g. Gemini).
+
+    LiteLLM exposes an OpenAI-compatible ``acompletion`` interface and handles
+    provider-specific auth/endpoints automatically via environment variables
+    (e.g. ``GEMINI_API_KEY``).  ``reasoning_effort`` is intentionally omitted
+    because non-OpenAI models don't support it.
+    """
+    kwargs: dict = dict(
+        model=req.model,
+        messages=[
+            {"role": "system", "content": req.system_prompt},
+            {"role": "user", "content": req.user_prompt},
+        ],
+    )
+    if req.response_format is not None:
+        kwargs["response_format"] = req.response_format
+    response = await litellm.acompletion(**kwargs)
+    content = response.choices[0].message.content
+    if isinstance(content, str):
+        return content
+    raise ValueError("Unexpected LiteLLM response format.")
+
+
 async def _call(client: AsyncOpenAI, req: OpenAIRequest) -> str:
+    if not _is_openai_model(req.model):
+        return await _call_litellm_api(req)
     if req.api == "chat":
         return await _call_chat_api(client, req)
     return await _call_responses_api(client, req)

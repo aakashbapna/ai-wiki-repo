@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from constants import (
     BUILD_WIKI_MAX_CONCURRENCY,
+    LLM_MODEL,
     STALE_TASK_TIMEOUT_SECONDS,
     WIKI_SIDEBAR_MAX_CHILDREN,
     WIKI_SIDEBAR_MAX_TOP_NODES,
@@ -89,7 +90,7 @@ class SubsystemSnapshot:
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def build_wiki(repo_hash: str, *, model: str = "gpt-5-mini") -> WikiTaskStatus:
+def build_wiki(repo_hash: str, *, model: str = LLM_MODEL) -> WikiTaskStatus:
     """Start a wiki build and return the task status immediately.
 
     The heavy work (LLM calls, page generation, sidebar) runs in a daemon

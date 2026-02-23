@@ -10,13 +10,13 @@ from typing import Iterable, TypedDict
 
 from sqlalchemy.orm import Session
 
-from constants import INDEX_FILE_MAX_CONCURRENCY, STALE_TASK_TIMEOUT_SECONDS
+from constants import INDEX_FILE_MAX_CONCURRENCY, LLM_MODEL, STALE_TASK_TIMEOUT_SECONDS
 from repo_analyzer.db import get_default_adapter
 from repo_analyzer.prompts import INDEX_FILE_SYSTEM_PROMPT
 from repo_analyzer.db_managers import RepoManager
 from repo_analyzer.models import IndexTask, RepoFile, RepoFileMetadata
 from repo_analyzer.models.index_task import TaskProgress, TaskStatus, TaskType, is_task_stale
-from repo_analyzer.utils.async_openai import OpenAIRequest, run_batch, stream_batch
+from repo_analyzer.utils.async_openai import OpenAIRequest, _is_openai_model, run_batch, stream_batch
 
 logger = logging.getLogger(__name__)
 
@@ -198,7 +198,7 @@ def index_repo(repo_hash: str, *, batch_size: int = 3) -> IndexTaskStatus:
 # Sync helper used by service.py for single-file re-index
 # ---------------------------------------------------------------------------
 
-def index_file(files: list[FileForIndex], *, model: str = "gpt-5-mini") -> list[FileSummary]:
+def index_file(files: list[FileForIndex], *, model: str = LLM_MODEL) -> list[FileSummary]:
     """Send a batch of files to the model and return per-file summaries (sync)."""
     if not files:
         return []
@@ -281,8 +281,8 @@ def _run_indexing(
         OpenAIRequest(
             system_prompt=system_prompt,
             user_prompt=_build_user_prompt(bp.payloads),
-            model="gpt-5-mini",
-            reasoning_effort="low",
+            model=LLM_MODEL,
+            reasoning_effort="low" if _is_openai_model(LLM_MODEL) else None,
         )
         for bp in batch_payloads
     ]

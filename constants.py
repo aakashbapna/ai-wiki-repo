@@ -8,6 +8,11 @@ _REPO_ROOT = Path(__file__).resolve().parent
 # Data directory; default "data" under repo root, overridable via DATA_DIR env
 DATA_DIR = Path(os.environ["DATA_DIR"]) if os.environ.get("DATA_DIR") else _REPO_ROOT / "data"
 
+# LLM model used for all AI tasks (file indexing, subsystem building, wiki generation).
+# Supports OpenAI models (gpt-*, o*) and Gemini via LiteLLM (gemini/<model-name>).
+# OPENAI_MODEL is a legacy alias kept for backward compatibility.
+LLM_MODEL: str = os.environ.get("LLM_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-5-mini"
+
 # Max file size (bytes) to include in scanning/indexing; overridable via MAX_SCAN_FILE_BYTES env
 MAX_SCAN_FILE_BYTES = 500 * 1024
 

@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from constants import (
     BUILD_SUBSYSTEM_MAX_CONCURRENCY,
+    LLM_MODEL,
     STALE_TASK_TIMEOUT_SECONDS,
     SUBSYSTEM_MAX_FINAL_COUNT,
     SUBSYSTEM_MAX_INITIAL_BATCHES,
@@ -83,7 +84,7 @@ class FileMetadataSnapshot:
 # Entry point
 # ===================================================================
 
-def create_subsystems(repo_hash: str, *, model: str = "gpt-5-mini") -> SubsystemStatus:
+def create_subsystems(repo_hash: str, *, model: str = LLM_MODEL) -> SubsystemStatus:
     """Start rebuilding subsystems for a repo in a background thread.
 
     Returns immediately with initial task status. Poll the task status
