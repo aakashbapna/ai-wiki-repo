@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import { Link, useNavigate, useParams } from "react-router-dom";
+import { markdownComponents } from "../components/MermaidMarkdown";
 import {
   fetchRepoFileContent,
   fetchRepoDetail,
@@ -226,9 +227,8 @@ export default function WikiPage(): JSX.Element {
         <div className="mt-4 space-y-2">
           {sidebarList.map((node) => {
             const isActive = node.page_id === (pageData?.page.page_id ?? selectedPageId);
-            const baseClass = `block rounded-lg px-3 py-2 text-sm ${
-              isActive ? "bg-ink text-white" : "text-ink"
-            } ${!node.is_active ? "opacity-50" : ""}`;
+            const baseClass = `block rounded-lg px-3 py-2 text-sm ${isActive ? "bg-ink text-white" : "text-ink"
+              } ${!node.is_active ? "opacity-50" : ""}`;
             const style = {
               marginLeft: `${node.depth * 12}px`,
               fontSize: node.depth > 0 ? "0.75rem" : undefined,
@@ -289,7 +289,7 @@ export default function WikiPage(): JSX.Element {
                   )}
                   <div className="rounded-lg border border-ink/10 bg-cloud p-4">
                     {node.content_type === "markdown" ? (
-                      <ReactMarkdown rehypePlugins={[rehypeHighlight]}>
+                      <ReactMarkdown rehypePlugins={[rehypeHighlight]} components={markdownComponents}>
                         {normalizeMarkdownHeadings(node.content)}
                       </ReactMarkdown>
                     ) : (
@@ -364,7 +364,7 @@ export default function WikiPage(): JSX.Element {
               {sourceError && <p className="text-sm text-red-600">{sourceError}</p>}
               {!sourceLoading && !sourceError && (
                 <div className="prose max-w-none">
-                  <ReactMarkdown rehypePlugins={[rehypeHighlight]}>
+                  <ReactMarkdown rehypePlugins={[rehypeHighlight]} components={markdownComponents}>
                     {formatCodeFence(
                       selectedSource.content ?? "",
                       guessLanguage(selectedSource.file_name),
