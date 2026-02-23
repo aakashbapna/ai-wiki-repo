@@ -24,6 +24,7 @@ WIKI_BUILDER_SYSTEM_PROMPT: str = (
     "where they exist — cite with the file path in parentheses, e.g. `start_server()` (`server.py`).\n"
     "- Include inline file citations for every non-obvious claim: *(see `path/to/file.py`)*.\n"
     "- Describe architecture decisions and trade-offs visible in the code.\n"
+    "- You can use mermaid diagrams to describe the architecture of the system.\n"
     "- Prefer concrete call sequences and data-flow descriptions over abstract prose.\n"
     "- Do not mention subsystem IDs, clustering, or internal wiki organisation.\n"
     "- Use file content directly — do not tell the reader 'this is a README/changelog/etc'; "
