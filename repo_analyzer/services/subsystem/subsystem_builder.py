@@ -530,12 +530,12 @@ def _phase2_cluster_batches(
             db_task.completed_files += len(batch["file_ids"])
             db_task.updated_at = int(time.time())
             db_task.set_progress(TaskProgress(
-                phase=f"Clustering files",
+                phase="Clustering files",
                 steps_done=batches_done,
                 steps_total=total_batches,
             ))
             write_session.add(db_task)
-	    write_session.commit()
+            write_session.commit()
 
         logger.info(
             "Phase 2 batch done batch_id=%d specs=%d repo_hash=%s, batches_done=%d, total_batches=%d",
