@@ -619,7 +619,6 @@ def _generate_and_save_sidebar_tree(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         model=model,
-        api="chat",
         response_format={"type": "json_object"},
     )], max_concurrency=1)
     if isinstance(results[0], Exception):

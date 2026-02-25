@@ -35,6 +35,9 @@ from repo_analyzer.utils.async_openai import OpenAIRequest, run_batch, stream_ba
 
 logger = logging.getLogger(__name__)
 
+# Phase 1 sends file metadata to the LLM in chunks of N files to stay within context limits.
+PHASE1_FILES_PER_CHUNK = 100
+
 
 # ---------------------------------------------------------------------------
 # Public / shared types
@@ -374,27 +377,50 @@ def _phase1_initial_batching_from_snapshots(
     model: str,
     valid_file_ids: set[int],
 ) -> list[FileBatch]:
-    """Send lightweight file metadata to LLM, get back ≤30 batches."""
+    """Send lightweight file metadata to LLM in chunks of 100, collect and merge batches."""
     items = _build_batch_items_from_snapshots(snapshots)
-    prompt = _build_phase1_prompt(items)
     system_prompt = SUBSYSTEM_BATCH_SYSTEM_PROMPT.format(
         max_batches=SUBSYSTEM_MAX_INITIAL_BATCHES,
     )
-    results = run_batch([OpenAIRequest(
-        system_prompt=system_prompt,
-        user_prompt=prompt,
-        model=model,
-        response_format={"type": "json_object"},
-    )], max_concurrency=1)
-    if isinstance(results[0], Exception):
-        raise results[0]
-    batches = _parse_phase1_response(results[0], valid_file_ids=valid_file_ids)
 
-    if not batches:
+    # Chunk into groups of 100 files per LLM call.
+    chunked: list[list[dict[str, object]]] = [
+        items[i : i + PHASE1_FILES_PER_CHUNK]
+        for i in range(0, len(items), PHASE1_FILES_PER_CHUNK)
+    ]
+    if not chunked:
+        return [FileBatch(batch_id=1, file_ids=sorted(valid_file_ids))]
+
+    requests: list[OpenAIRequest] = [
+        OpenAIRequest(
+            system_prompt=system_prompt,
+            user_prompt=_build_phase1_prompt(chunk_items),
+            model=model,
+            response_format={"type": "json_object"},
+        )
+        for chunk_items in chunked
+    ]
+    results = run_batch(requests, max_concurrency=10)
+
+    # Parse each chunk's response with that chunk's file_ids as valid, then merge.
+    all_batches: list[FileBatch] = []
+    next_batch_id = 1
+    for chunk_items, raw in zip(chunked, results):
+        if isinstance(raw, Exception):
+            raise raw
+        chunk_file_ids: set[int] = {int(it["file_id"]) for it in chunk_items}
+        chunk_batches = _parse_phase1_response(raw, valid_file_ids=chunk_file_ids)
+        for b in chunk_batches:
+            all_batches.append(
+                FileBatch(batch_id=next_batch_id, file_ids=b["file_ids"])
+            )
+            next_batch_id += 1
+
+    if not all_batches:
         logger.warning("Phase 1 returned 0 batches; falling back to single batch")
-        batches = [FileBatch(batch_id=1, file_ids=sorted(valid_file_ids))]
+        return [FileBatch(batch_id=1, file_ids=sorted(valid_file_ids))]
 
-    return batches
+    return all_batches
 
 
 # ===================================================================
@@ -504,17 +530,20 @@ def _phase2_cluster_batches(
             db_task.completed_files += len(batch["file_ids"])
             db_task.updated_at = int(time.time())
             db_task.set_progress(TaskProgress(
-                phase=f"Clustering files — batch {batches_done}/{total_batches}",
+                phase=f"Clustering files",
                 steps_done=batches_done,
                 steps_total=total_batches,
             ))
-            write_session.commit()
+            write_session.add(db_task)
+	    write_session.commit()
 
         logger.info(
-            "Phase 2 batch done batch_id=%d specs=%d repo_hash=%s",
+            "Phase 2 batch done batch_id=%d specs=%d repo_hash=%s, batches_done=%d, total_batches=%d",
             batch["batch_id"],
             len(specs),
             repo_hash,
+            batches_done,
+            total_batches,
         )
 
     return all_specs
@@ -557,25 +586,41 @@ def _parse_merge_response(text: str) -> MergeResult:
     return MergeResult(subsystems=specs, continue_merging=continue_merging)
 
 
+PHASE3_SPECS_PER_BATCH = 50
+
+
 def _merge_single_round(
     specs: list[SubsystemSpec],
     *,
     model: str,
 ) -> MergeResult:
-    """Call LLM with current subsystem list, return merged list + flag."""
-    prompt = _build_phase3_prompt(specs)
+    """Call LLM with current subsystem list, return merged list + flag.
+
+    Processes specs in batches of 50 to handle large spec counts.
+    """
     system_prompt = SUBSYSTEM_MERGE_SYSTEM_PROMPT.format(
         max_final=SUBSYSTEM_MAX_FINAL_COUNT,
     )
-    results = run_batch([OpenAIRequest(
-        system_prompt=system_prompt,
-        user_prompt=prompt,
-        model=model,
-        response_format={"type": "json_object"},
-    )], max_concurrency=1)
-    if isinstance(results[0], Exception):
-        raise results[0]
-    return _parse_merge_response(results[0])
+    requests: list[OpenAIRequest] = []
+    for i in range(0, len(specs), PHASE3_SPECS_PER_BATCH):
+        batch = specs[i : i + PHASE3_SPECS_PER_BATCH]
+        prompt = _build_phase3_prompt(batch)
+        requests.append(OpenAIRequest(
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+            model=model,
+            response_format={"type": "json_object"},
+        ))
+    results = run_batch(requests, max_concurrency=10)
+    all_subsystems: list[SubsystemSpec] = []
+    any_continue = False
+    for result in results:
+        if isinstance(result, Exception):
+            raise result
+        merge_result = _parse_merge_response(result)
+        all_subsystems.extend(merge_result["subsystems"])
+        any_continue = any_continue or merge_result["continue_merging"]
+    return MergeResult(subsystems=all_subsystems, continue_merging=any_continue)
 
 
 def _specs_are_stable(
