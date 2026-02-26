@@ -2,7 +2,7 @@ import logging
 from pathlib import Path
 
 from dotenv import load_dotenv
-
+import os
 from flask import Flask, request, jsonify, send_from_directory
 import openai._utils._logs
 openai._utils._logs.logger.setLevel(logging.WARNING)
@@ -276,6 +276,27 @@ def get_wiki_pages(repo_hash_: str) -> tuple:
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/repos/<string:repo_hash_>/wiki/export", methods=["POST"])
+def export_wiki_to_repo_endpoint(repo_hash_: str) -> tuple:
+    """
+    Export wiki sidebar and pages to wiki/ folder in the repo.
+    Switches to branch ai-repo-wiki, writes markdown files, commits, and pushes.
+    """
+    try:
+        logger.info("Wiki export requested: %s", repo_hash_)
+        push = request.args.get("push", "true").lower() == "true"
+        result = WikiService.export_wiki_to_repo(repo_hash_, push=push)
+        return jsonify(result), 200
+    except ValueError as e:
+        msg = str(e)
+        code = 404 if msg.startswith("Repo not found") else 400
+        logger.info("Wiki export validation failed: %s", msg)
+        return jsonify({"error": msg}), code
+    except Exception as e:
+        logger.exception("wiki export failed.")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/repos/<string:repo_hash_>/wiki/pages/<int:page_id>", methods=["GET"])
 def get_wiki_page_with_contents(repo_hash_: str, page_id: int) -> tuple:
     """Return a wiki page and its contents."""
@@ -390,4 +411,6 @@ def serve_frontend(path: str) -> object:
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    debug=os.environ.get("DEBUG", "false").lower() == "true"
+    print(f"Starting server on port 5000... debug={debug}")
+    app.run(debug=debug, host="localhost", port=5000)

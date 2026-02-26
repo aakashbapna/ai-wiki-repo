@@ -1,9 +1,18 @@
-"""Clone GitHub (or other Git) repositories using dulwich."""
+"""Git operations for repositories using dulwich porcelain.
 
+Provides clone, checkout, commit, and push operations for managing
+repository state.
+"""
+
+import logging
 import warnings
 from pathlib import Path
 
 from dulwich import porcelain
+
+logger = logging.getLogger(__name__)
+
+WIKI_BRANCH = "ai-repo-wiki"
 
 
 def _parse_repo_url(repo_url: str) -> tuple[str, str | None]:
@@ -19,7 +28,6 @@ def _parse_repo_url(repo_url: str) -> tuple[str, str | None]:
 
 def _repo_slug(repo_url: str) -> str:
     """Derive a filesystem-safe slug from a repo URL (e.g. owner/repo or repo)."""
-    # Strip .git and trailing slashes, then take the last path part or owner/repo
     url = repo_url.rstrip("/").removesuffix(".git")
     parts = url.rstrip("/").split("/")
     if len(parts) >= 2:
@@ -52,7 +60,6 @@ def clone_repo(
     url_only, branch = _parse_repo_url(repo_url)
 
     if data_dir is None:
-        # Default: repo root is parent of repo_analyzer package
         repo_root = Path(__file__).resolve().parents[3]
         data_dir = repo_root / "data"
     else:
@@ -82,3 +89,79 @@ def clone_repo(
     )
 
     return target
+
+
+def checkout_or_create_branch(repo_path: Path | str, branch: str = WIKI_BRANCH) -> None:
+    """
+    Switch to the given branch, creating it from HEAD if it does not exist.
+
+    Args:
+        repo_path: Path to the repository.
+        branch: Branch name to checkout or create.
+    """
+    repo_path = Path(repo_path)
+    if not (repo_path / ".git").exists():
+        raise ValueError(f"Not a git repository: {repo_path}")
+
+    branches = porcelain.branch_list(repo_path)
+    branch_exists = branch.encode("utf-8") in branches
+    if branch_exists:
+        porcelain.checkout(repo_path, target=branch)
+    else:
+        porcelain.branch_create(repo_path, branch)
+        porcelain.checkout(repo_path, target=branch)
+
+
+def stage_and_commit(
+    repo_path: Path | str,
+    paths: list[str],
+    message: str,
+    *,
+    author: str | None = None,
+) -> bytes:
+    """
+    Stage the given paths and create a commit.
+
+    Args:
+        repo_path: Path to the repository.
+        paths: List of paths to stage (relative to repo root).
+        message: Commit message.
+        author: Optional "Name <email>" for author/committer.
+
+    Returns:
+        SHA of the new commit.
+    """
+    repo_path = Path(repo_path)
+    porcelain.add(repo_path, paths=paths)
+    return porcelain.commit(
+        repo_path,
+        message=message,
+        author=author or "AI Wiki <ai-wiki@local>",
+        committer=author or "AI Wiki <ai-wiki@local>",
+    )
+
+
+def push_branch(
+    repo_path: Path | str,
+    branch: str = WIKI_BRANCH,
+    *,
+    remote: str = "origin",
+    force: bool = False,
+) -> None:
+    """
+    Push the given branch to the remote.
+
+    Args:
+        repo_path: Path to the repository.
+        branch: Branch name to push.
+        remote: Remote name (default: origin).
+        force: Force push overwriting remote refs.
+    """
+    repo_path = Path(repo_path)
+    refspec = f"refs/heads/{branch}:refs/heads/{branch}"
+    porcelain.push(
+        repo_path,
+        remote_location=remote,
+        refspecs=[refspec],
+        force=force,
+    )

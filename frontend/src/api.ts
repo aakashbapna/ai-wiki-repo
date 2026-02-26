@@ -185,6 +185,24 @@ export async function fetchWikiStatus(repoHash: string): Promise<IndexStatus> {
   return requestJson<IndexStatus>(`/repos/${repoHash}/wiki/build`);
 }
 
+export type WikiExportResult = {
+  repo_hash: string;
+  branch: string;
+  wiki_path: string;
+  files_written: number;
+  commit_sha: string;
+  pr_url: string;
+};
+
+export async function exportWikiToRepo(
+  repoHash: string,
+  options?: { push?: boolean },
+): Promise<WikiExportResult> {
+  const push = options?.push ?? true;
+  const url = `/repos/${repoHash}/wiki/export?push=${push}`;
+  return requestJson<WikiExportResult>(url, { method: "POST" });
+}
+
 export async function clearAllData(): Promise<{ repos_deleted: number; files_deleted: number }> {
   return requestJson<{ repos_deleted: number; files_deleted: number }>(`/data`, { method: "DELETE" });
 }

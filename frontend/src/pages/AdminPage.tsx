@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import {
+  exportWikiToRepo,
   fetchIndexStatus,
   fetchSubsystemStatus,
   fetchWikiSidebars,
@@ -25,6 +26,13 @@ export default function AdminPage(): JSX.Element {
   const [wikiStatus, setWikiStatus] = useState<IndexStatus | null>(null);
   const [wikiSidebars, setWikiSidebars] = useState<WikiSidebarNode[]>([]);
   const [wikiLoading, setWikiLoading] = useState<boolean>(false);
+  const [wikiExportLoading, setWikiExportLoading] = useState<boolean>(false);
+  const [wikiExportResult, setWikiExportResult] = useState<{
+    files_written: number;
+    branch: string;
+    commit_sha: string;
+    pr_url: string;
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [activeTab, setActiveTab] = useState<"index" | "subsystems" | "wiki">(
@@ -143,6 +151,30 @@ export default function AdminPage(): JSX.Element {
       const message =
         err instanceof Error ? err.message : "Failed to build subsystems.";
       setError(message);
+    }
+  };
+
+  const handleExportWiki = async (): Promise<void> => {
+    if (!selectedRepo) {
+      return;
+    }
+    try {
+      setWikiExportLoading(true);
+      setWikiExportResult(null);
+      setError(null);
+      const result = await exportWikiToRepo(selectedRepo);
+      setWikiExportResult({
+        files_written: result.files_written,
+        branch: result.branch,
+        commit_sha: result.commit_sha,
+        pr_url: result.pr_url,
+      });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to export wiki to repo.";
+      setError(message);
+    } finally {
+      setWikiExportLoading(false);
     }
   };
 
@@ -439,6 +471,33 @@ export default function AdminPage(): JSX.Element {
             >
               Build Wiki
             </button>
+            <button
+              type="button"
+              onClick={handleExportWiki}
+              disabled={wikiExportLoading || !selectedRepo}
+              className="rounded-xl border border-ink/20 bg-white px-4 py-3 text-sm font-semibold text-ink hover:bg-mist disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {wikiExportLoading ? "Exporting…" : "Export Markdown to Repo"}
+            </button>
+            {wikiExportResult && (
+              <div className="space-y-1 text-xs text-ink/70">
+                <p>
+                  Exported {wikiExportResult.files_written} files to branch{" "}
+                  <code className="rounded bg-cloud px-1">{wikiExportResult.branch}</code>
+                  {" "}(commit {wikiExportResult.commit_sha.slice(0, 7)}).
+                </p>
+                {wikiExportResult.pr_url && (
+                  <a
+                    href={wikiExportResult.pr_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="block font-medium text-accentDark hover:underline"
+                  >
+                    Create pull request →
+                  </a>
+                )}
+              </div>
+            )}
             {selectedRepo && (
               <a
                 href={`/wiki/${selectedRepo}`}

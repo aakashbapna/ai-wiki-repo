@@ -9,6 +9,10 @@ from repo_analyzer.db_managers import RepoManager, WikiManager
 from repo_analyzer.models import IndexTask, RepoFile
 from repo_analyzer.models.index_task import TaskProgress, TaskStatus, TaskType, is_task_stale
 from repo_analyzer.services.wiki.wiki_builder import build_wiki
+from repo_analyzer.services.wiki.wiki_markdown_export import (
+    WikiExportResult,
+    export_wiki_to_repo,
+)
 
 
 class WikiTaskStatus(TypedDict):
@@ -129,6 +133,11 @@ class WikiService:
                 }
                 for c in contents
             ]
+
+    @staticmethod
+    def export_wiki_to_repo(repo_hash: str, *, push: bool = True) -> WikiExportResult:
+        """Export wiki sidebar and pages to wiki/ folder, commit and push on ai-repo-wiki branch."""
+        return export_wiki_to_repo(repo_hash, push=push)
 
     @staticmethod
     def get_page_with_contents(repo_hash: str, page_id: int) -> dict[str, object]:
